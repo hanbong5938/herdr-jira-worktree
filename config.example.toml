@@ -70,31 +70,14 @@ Please analyze the issue, implement the fix or feature it describes, and
 summarize what you changed when you are done.
 """
 
-# Press Enter in the agent pane after sending the prompt (submit it).
+# Deliver and submit via `herdr agent prompt`; false only pastes the text.
 submit = true
 
-# Delay between sending the text and pressing Enter, in milliseconds.
+# Legacy setting, accepted but ignored: herdr handles submission server-side.
 submit_delay_ms = 500
 
 # Truncate very long descriptions in the prompt to this many characters.
 max_description_chars = 6000
-
-# --- Start a new agent from the delegate picker ---
-# With `d`, pick "+ start new agent…" (or press `n`) to spawn a fresh agent
-# via `herdr agent start`, then send the same prompt into it with Jira context.
-#
-# Agents offered in that wizard (name is the label; command is argv after --):
-[[delegate.agents]]
-name = "claude"
-command = ["claude"]
-
-[[delegate.agents]]
-name = "codex"
-command = ["codex"]
-
-[[delegate.agents]]
-name = "grok"
-command = ["grok"]
 
 # Optional preferred cwd (listed first in the directory picker).
 # default_cwd = "~/Work"
@@ -112,5 +95,24 @@ focus_new = false
 # time to draw its input line.
 startup_delay_ms = 1500
 
-# Then wait up to this many ms for the agent to report idle (0 = skip).
+# Then wait up to this many ms for detection AND idle. On failure, the prompt
+# is not sent. 0 skips the readiness check (not recommended for cold starts).
 wait_ready_ms = 30000
+
+# --- Start a new agent from the delegate picker ---
+# With `d`, pick "+ start new agent…" (or press `n`) to run a fresh agent
+# via `herdr pane run`, then send the same prompt into it with Jira context.
+#
+# Keep [delegate] settings ABOVE these array entries (TOML table scoping).
+# Agents offered in that wizard (name is the label; command is shell-quoted argv):
+[[delegate.agents]]
+name = "claude"
+command = ["claude"]
+
+[[delegate.agents]]
+name = "codex"
+command = ["codex"]
+
+[[delegate.agents]]
+name = "grok"
+command = ["grok"]

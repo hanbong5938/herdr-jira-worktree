@@ -30,9 +30,9 @@ template (issue key, summary, description, link, …).
   and applies the one you pick.
 - **Delegate to an agent** — `d` lists agents currently running in herdr
   (claude, codex, grok, …) with status and cwd; pick one and the issue is sent
-  as a prompt from your `[delegate].prompt` template, then submitted with Enter
+  as a prompt from your `[delegate].prompt` template and submitted server-side
   (configurable). Or choose **+ start new agent…** (`n`) to pick an agent type
-  and working directory — herdr spawns it via `agent start` and the same Jira
+  and working directory — herdr runs it via `pane run` and the same Jira
   prompt is sent as soon as the agent is ready.
 
 Works with Jira Cloud (email + API token) and Jira Server / Data Center
@@ -41,7 +41,7 @@ used when available, with automatic fallback to the classic `/rest/api/2/search`
 
 ## Install
 
-Requires a Rust toolchain (https://rustup.rs) at install time.
+Requires herdr **0.8.0+** and a Rust toolchain (https://rustup.rs) at install time.
 
 ```sh
 herdr plugin install a2u/herdr-jira
@@ -87,7 +87,13 @@ Link: {url}
 Description:
 {description}
 """
-submit = true          # press Enter in the agent pane after sending
+submit = true          # submit server-side; false only pastes the text
+
+# default_cwd = "~/Work"
+placement = "tab"      # "tab" | "right" | "down"
+focus_new = false
+startup_delay_ms = 1500
+wait_ready_ms = 30000
 
 # Agents you can spawn from the delegate picker ("+ start new agent…")
 [[delegate.agents]]
@@ -101,12 +107,6 @@ command = ["codex"]
 [[delegate.agents]]
 name = "grok"
 command = ["grok"]
-
-# default_cwd = "~/Work"
-placement = "tab"      # "tab" | "right" | "down"
-focus_new = false
-startup_delay_ms = 1500
-wait_ready_ms = 30000
 ```
 
 For Jira Cloud, create an API token at
@@ -163,9 +163,12 @@ command = "herdr-jira.open-jira-tab"
 `{key}` `{summary}` `{description}` `{url}` `{status}` `{assignee}`
 `{reporter}` `{priority}` `{type}` `{labels}`
 
-The prompt is sent with `herdr agent send` (literal text — newlines insert
-line breaks in agent CLIs, they don't submit), followed by an Enter keypress
-after `submit_delay_ms` when `submit = true`.
+With `submit = true`, `herdr agent prompt <pane-id> <text>` delivers and
+submits the prompt server-side, avoiding a race between pasted text and Enter.
+With `submit = false`, `herdr pane send-text <pane-id> <text>` only pastes the
+text. The legacy `submit_delay_ms` setting is accepted but no longer used.
+Delivery errors are shown without retrying through raw input, to avoid duplicate
+prompts or typing into a startup dialog.
 
 ### Starting a new agent
 
@@ -188,11 +191,17 @@ herdr pane run <root-pane> '<command...>'
 herdr agent rename <root-pane> <issue-agent-id>
 ```
 
-With `placement = "right"` or `"down"` it uses `herdr agent start --split …`
-in the chosen space instead.
+With `placement = "right"` or `"down"` it uses `herdr pane split <parent-pane>
+--direction right|down --cwd <dir> --no-focus`, then `pane run` in the returned
+pane. The parent is Jira's pane if it belongs to the selected workspace;
+otherwise the focused pane (or first available pane) in that workspace.
+`focus_new = true` uses `--focus` for either placement.
 
-Then it waits `startup_delay_ms` (and up to `wait_ready_ms` for `idle`), and
-sends the same rendered Jira prompt into the new agent.
+Then it waits `startup_delay_ms`, polls `agent get` until detection, and uses
+`agent wait --until idle` before sending the rendered Jira prompt. Detection
+and idle share a single `wait_ready_ms` budget. If readiness fails, the prompt
+is **not sent** and an error is shown. `wait_ready_ms = 0` explicitly disables
+this check; it is not recommended for cold agent starts.
 
 ## License
 

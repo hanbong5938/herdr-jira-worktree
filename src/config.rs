@@ -52,13 +52,12 @@ impl Default for SearchConfig {
     }
 }
 
-/// One agent binary that can be spawned via `herdr agent start` when
-/// delegating with "start new agent".
+/// One agent binary that can be run in a new pane when delegating.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpawnAgent {
     /// Display label and default herdr agent name prefix (e.g. "claude").
     pub name: String,
-    /// Argv passed after `--` to `herdr agent start` (e.g. `["claude"]`).
+    /// Argv shell-quoted for `herdr pane run` (e.g. `["claude"]`).
     pub command: Vec<String>,
 }
 
@@ -68,6 +67,7 @@ pub struct DelegateConfig {
     pub prompt: String,
     #[serde(default = "default_true")]
     pub submit: bool,
+    /// Legacy setting, ignored: `agent prompt` handles submission server-side.
     #[serde(default = "default_submit_delay")]
     pub submit_delay_ms: u64,
     #[serde(default = "default_max_desc")]
@@ -88,12 +88,12 @@ pub struct DelegateConfig {
     /// Focus the new agent pane / tab after start.
     #[serde(default)]
     pub focus_new: bool,
-    /// Always wait this long after `agent start` before sending the prompt
+    /// Always wait this long after `pane run` before sending the prompt
     /// (gives the CLI time to paint its input). Milliseconds.
     #[serde(default = "default_startup_delay")]
     pub startup_delay_ms: u64,
-    /// After the startup delay, wait up to this many ms for the agent to
-    /// report `idle` before sending. 0 skips the wait.
+    /// After the startup delay, wait up to this many ms for detection and
+    /// `idle`. Failure aborts delivery; 0 explicitly skips the readiness check.
     #[serde(default = "default_wait_ready")]
     pub wait_ready_ms: u64,
 }
@@ -229,5 +229,28 @@ impl Config {
             return Err("api_token_cmd produced no output".into());
         }
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_delegate_settings_are_not_nested_under_last_agent() {
+        let raw = include_str!("../config.example.toml")
+            .replace("placement = \"tab\"", "placement = \"right\"")
+            .replace("focus_new = false", "focus_new = true")
+            .replace("startup_delay_ms = 1500", "startup_delay_ms = 123")
+            .replace("wait_ready_ms = 30000", "wait_ready_ms = 456")
+            .replace("submit_delay_ms = 500", "submit_delay_ms = 789");
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(cfg.delegate.placement, "right");
+        assert!(cfg.delegate.focus_new);
+        assert_eq!(cfg.delegate.startup_delay_ms, 123);
+        assert_eq!(cfg.delegate.wait_ready_ms, 456);
+        // Old configs remain parseable even though this setting is ignored.
+        assert_eq!(cfg.delegate.submit_delay_ms, 789);
+        assert_eq!(cfg.delegate.agents.len(), 3);
     }
 }
