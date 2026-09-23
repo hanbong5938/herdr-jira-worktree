@@ -1,7 +1,9 @@
 # herdr-jira-worktree
 
 Fork of [a2u/herdr-jira](https://github.com/a2u/herdr-jira) by Vitalii Rudnykh,
-adding a `w` key that checks out a Jira issue into a fresh git worktree.
+adding a `w` key that checks out a Jira issue into a new or existing git
+worktree per herdr project, and issue comments in the details view. Versioned
+independently of upstream (this fork starts at 0.1.0).
 
 A Jira TUI that lives in a [herdr](https://herdr.dev) pane: browse issues through
 configurable JQL filters, search, change issue status, and delegate an issue to
@@ -15,7 +17,7 @@ template (issue key, summary, description, link, …).
 │ PROJ-142    In Progress   Vitalii R.        2026-07-14 10:02 Fix …  │
 │ PROJ-137    To Do         Vitalii R.        2026-07-13 18:40 Add …  │
 ╰─────────────────────────────────────────────────────────────────────╯
- Enter open · f filters · / search · s status · d delegate · o browser
+ Enter open · w worktree · d delegate · s status · f filters · / search · ? help
 ```
 
 ## Features
@@ -160,6 +162,8 @@ command = "han.jira-worktree.open-jira-tab"
 | Key | Action |
 | --- | --- |
 | `j`/`k`, `↑`/`↓` | move / scroll |
+| `PgUp`/`PgDn` | move / scroll by 15 |
+| `g`/`G`, `Home`/`End` | top / bottom (details: `g` scrolls to top) |
 | `Enter` | open issue details |
 | `Tab` | issue details: switch scrolling between description and comments |
 | `→`/`l`, `←`/`h` | expand / collapse an epic (shows its child issues inline) |
@@ -172,9 +176,11 @@ command = "han.jira-worktree.open-jira-tab"
 | `n` | in the delegate picker: start a new agent |
 | `1`–`9` | quick pick inside any popup (agents, transitions, filters) |
 | `o` | open issue in the browser |
+| `z` | zoom the Jira pane (fullscreen toggle) |
 | `r` | refresh current filter |
 | `R` | reload config |
 | `?` | help |
+| `Esc` | back / cancel |
 | `q` | quit |
 
 ## Delegate prompt placeholders
