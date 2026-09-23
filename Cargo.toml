@@ -1,9 +1,10 @@
 [package]
 name = "herdr-jira"
-version = "0.3.2"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Jira TUI plugin for herdr: filters, search, status transitions, delegate issues to running or new agents"
+description = "Jira TUI plugin for herdr (fork of a2u/herdr-jira): filters, search, status transitions, delegate issues to agents, check out issues into git worktrees"
+repository = "https://github.com/hanbong5938/herdr-jira-worktree"
 
 [dependencies]
 ratatui = "0.29"

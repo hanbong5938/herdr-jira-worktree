@@ -16,6 +16,8 @@ struct Step {
     args: Vec<String>,
     response: Value,
     exit: u8,
+    /// Print the response on stderr (herdr 0.9.1 API errors) instead of stdout.
+    stderr: bool,
     delay_ms: u64,
 }
 
@@ -25,6 +27,7 @@ impl Step {
             args: args.iter().map(|s| s.to_string()).collect(),
             response,
             exit: 0,
+            stderr: false,
             delay_ms: 0,
         }
     }
@@ -32,6 +35,7 @@ impl Step {
     fn error(args: &[&str], code: &str) -> Self {
         Self {
             exit: 1,
+            stderr: true,
             ..Self::ok(
                 args,
                 json!({"error": {"code": code, "message": "test failure"}}),
@@ -77,18 +81,19 @@ impl MockCli {
                 i + 1
             ));
             for (j, arg) in step.args.iter().enumerate() {
+                // Braces: POSIX sh reads `$10` as `${1}0`.
                 // A readiness timeout must be positive and use only the
                 // remaining budget, not restart it after agent detection.
                 if let Some(max) = arg.strip_prefix("TIMEOUT<=") {
                     script.push_str(&format!(
-                        "[ \"${}\" -gt 0 ] && [ \"${}\" -le {} ] || fail 'invalid timeout'\n",
+                        "[ \"${{{}}}\" -gt 0 ] && [ \"${{{}}}\" -le {} ] || fail 'invalid timeout'\n",
                         j + 1,
                         j + 1,
                         max
                     ));
                 } else {
                     script.push_str(&format!(
-                        "[ \"${}\" = {} ] || fail 'step {}: wrong argument {}'\n",
+                        "[ \"${{{}}}\" = {} ] || fail 'step {}: wrong argument {}'\n",
                         j + 1,
                         quote(arg),
                         i + 1,
@@ -100,8 +105,9 @@ impl MockCli {
                 script.push_str(&format!("sleep {:.3}\n", step.delay_ms as f64 / 1000.0));
             }
             script.push_str(&format!(
-                "printf '%s\\n' {}\nexit {}\n;;\n",
+                "printf '%s\\n' {}{}\nexit {}\n;;\n",
                 quote(&step.response.to_string()),
+                if step.stderr { " >&2" } else { "" },
                 step.exit
             ));
         }
@@ -168,7 +174,89 @@ fn opts(placement: &str) -> StartAgentOpts {
         focus: false,
         workspace_id: "w2".into(),
         tab_label: "TEST-1".into(),
+        worktree: None,
     }
+}
+
+const CHECKOUT: &str = "/tmp/wt/project/test-1";
+
+fn worktree_opts() -> WorktreeOpts {
+    WorktreeOpts {
+        branch: "TEST-1".into(),
+        base: "origin/main".into(),
+        path: CHECKOUT.into(),
+        label: "TEST-1".into(),
+        trust_repository: false,
+    }
+}
+
+fn worktree_opts_start() -> StartAgentOpts {
+    StartAgentOpts {
+        worktree: Some(worktree_opts()),
+        ..opts("tab")
+    }
+}
+
+/// `worktree open --cwd <repo> --branch TEST-1 --label TEST-1 <focus> [trust]`.
+fn worktree_open_args(extra: &[&'static str]) -> Vec<&'static str> {
+    let mut args = vec![
+        "worktree",
+        "open",
+        "--cwd",
+        "/tmp/project with spaces",
+        "--branch",
+        "TEST-1",
+        "--label",
+        "TEST-1",
+    ];
+    args.extend(extra);
+    args
+}
+
+/// `worktree create ... --base origin/main --path <checkout> --label TEST-1 <focus> [trust]`.
+fn worktree_create_args(extra: &[&'static str]) -> Vec<&'static str> {
+    let mut args = vec![
+        "worktree",
+        "create",
+        "--cwd",
+        "/tmp/project with spaces",
+        "--branch",
+        "TEST-1",
+        "--base",
+        "origin/main",
+        "--path",
+        CHECKOUT,
+        "--label",
+        "TEST-1",
+    ];
+    args.extend(extra);
+    args
+}
+
+/// Real `herdr worktree open|create` result shape (trimmed).
+fn worktree_response(kind: &str, already_open: bool) -> Value {
+    json!({"id": "cli:worktree", "result": {
+        "type": kind,
+        "already_open": already_open,
+        "root_pane": {"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "cwd": CHECKOUT},
+        "tab": {"tab_id": "w3:t1"},
+        "workspace": {"workspace_id": "w3", "label": "TEST-1",
+            "worktree": {"checkout_path": CHECKOUT, "is_linked_worktree": true}},
+        "worktree": {"branch": "TEST-1", "path": CHECKOUT, "open_workspace_id": "w3"}
+    }})
+}
+
+fn run_in_pane_steps(pane: &'static str) -> Vec<Step> {
+    vec![
+        Step::ok(
+            &["pane", "run", pane, "claude --model 'model name'"],
+            json!({"result": {}}),
+        ),
+        Step::ok(
+            &["agent", "rename", pane, "jira-TEST-1"],
+            json!({"result": {}}),
+        ),
+    ]
 }
 
 fn tab_start_steps() -> Vec<Step> {
@@ -214,18 +302,19 @@ fn parsed_agents_use_pane_ids_and_exclude_non_delegable_panes() {
 }
 
 #[test]
-fn response_errors_preserve_api_codes_from_stdout() {
+fn response_errors_preserve_api_codes_from_stdout_or_stderr() {
+    let error = r#"{"error":{"code":"agent_not_found","message":"not detected"}}"#;
+    // Older herdr: error JSON on stdout (exit status may even be 0).
     for success in [false, true] {
-        let e = parse_response(
-            &["agent", "get", "w2:p3"],
-            success,
-            r#"{"error":{"code":"agent_not_found","message":"not detected"}}"#,
-            "",
-        )
-        .unwrap_err();
+        let e = parse_response(&["agent", "get", "w2:p3"], success, error, "").unwrap_err();
         assert_eq!(e.code.as_deref(), Some("agent_not_found"));
         assert!(e.message.contains("not detected"));
     }
+    // herdr 0.9.1: error JSON on stderr, empty stdout, exit 1.
+    let e =
+        parse_response(&["agent", "get", "w2:p3"], false, "", &format!("{error}\n")).unwrap_err();
+    assert_eq!(e.code.as_deref(), Some("agent_not_found"));
+    assert!(e.message.contains("not detected"));
 }
 
 #[test]
@@ -500,8 +589,194 @@ fn invalid_start_options_do_not_invoke_cli() {
     options = opts("tab");
     options.name.clear();
     assert!(start_agent(&options).is_err());
-    options = opts("tab");
-    options.workspace_id.clear();
+    for placement in ["tab", "", "right", "down"] {
+        options = opts(placement);
+        options.workspace_id.clear();
+        assert!(start_agent(&options).is_err(), "{placement:?}");
+    }
+    mock.assert_complete();
+}
+
+#[test]
+fn invalid_worktree_options_do_not_invoke_cli() {
+    let mock = MockCli::new(vec![]);
+    let mut options = worktree_opts_start();
+    options.worktree = Some(WorktreeOpts {
+        branch: " ".into(),
+        ..worktree_opts()
+    });
     assert!(start_agent(&options).is_err());
+    assert!(open_or_create_worktree("", &worktree_opts(), false).is_err());
+    mock.assert_complete();
+}
+
+#[test]
+fn new_worktree_branch_is_created_then_agent_runs_in_its_root_pane() {
+    let mut steps = vec![
+        Step::error(&worktree_open_args(&["--no-focus"]), "worktree_not_found"),
+        Step::ok(
+            &worktree_create_args(&["--no-focus"]),
+            worktree_response("worktree_created", false),
+        ),
+    ];
+    steps.extend(run_in_pane_steps("w3:p1"));
+    let mock = MockCli::new(steps);
+    let started = start_agent(&worktree_opts_start()).unwrap();
+    assert_eq!(started.target, "w3:p1");
+    assert_eq!(started.cwd, CHECKOUT);
+    mock.assert_complete();
+}
+
+#[test]
+fn worktree_start_does_not_need_a_workspace() {
+    let mut steps = vec![
+        Step::error(&worktree_open_args(&["--no-focus"]), "worktree_not_found"),
+        Step::ok(
+            &worktree_create_args(&["--no-focus"]),
+            worktree_response("worktree_created", false),
+        ),
+    ];
+    steps.extend(run_in_pane_steps("w3:p1"));
+    let mock = MockCli::new(steps);
+    let mut options = worktree_opts_start();
+    options.workspace_id.clear();
+    let started = start_agent(&options).unwrap();
+    assert_eq!(started.target, "w3:p1");
+    assert_eq!(started.cwd, CHECKOUT);
+    mock.assert_complete();
+}
+
+#[test]
+fn empty_worktree_base_path_and_label_are_omitted() {
+    let mock = MockCli::new(vec![
+        Step::error(
+            &[
+                "worktree",
+                "open",
+                "--cwd",
+                "/tmp/project with spaces",
+                "--branch",
+                "TEST-1",
+                "--no-focus",
+            ],
+            "worktree_not_found",
+        ),
+        Step::ok(
+            &[
+                "worktree",
+                "create",
+                "--cwd",
+                "/tmp/project with spaces",
+                "--branch",
+                "TEST-1",
+                "--no-focus",
+            ],
+            worktree_response("worktree_created", false),
+        ),
+    ]);
+    let wt = WorktreeOpts {
+        branch: "TEST-1".into(),
+        ..WorktreeOpts::default()
+    };
+    let opened = open_or_create_worktree("/tmp/project with spaces", &wt, false).unwrap();
+    assert_eq!(opened.pane_id, "w3:p1");
+    mock.assert_complete();
+}
+
+#[test]
+fn closed_worktree_is_reopened_without_create() {
+    let mut steps = vec![Step::ok(
+        &worktree_open_args(&["--no-focus"]),
+        worktree_response("worktree_opened", false),
+    )];
+    steps.extend(run_in_pane_steps("w3:p1"));
+    let mock = MockCli::new(steps);
+    let started = start_agent(&worktree_opts_start()).unwrap();
+    assert_eq!(started.target, "w3:p1");
+    assert_eq!(started.cwd, CHECKOUT);
+    mock.assert_complete();
+}
+
+#[test]
+fn already_open_worktree_gets_a_new_tab_instead_of_its_busy_root_pane() {
+    let mut steps = vec![
+        Step::ok(
+            &worktree_open_args(&["--no-focus"]),
+            worktree_response("worktree_opened", true),
+        ),
+        Step::ok(
+            &[
+                "tab",
+                "create",
+                "--workspace",
+                "w3",
+                "--cwd",
+                CHECKOUT,
+                "--label",
+                "TEST-1",
+                "--no-focus",
+            ],
+            json!({"result": {"tab": {"tab_id": "w3:t2"}, "root_pane": {"pane_id": "w3:p2"}}}),
+        ),
+    ];
+    steps.extend(run_in_pane_steps("w3:p2"));
+    let mock = MockCli::new(steps);
+    let started = start_agent(&worktree_opts_start()).unwrap();
+    assert_eq!(started.target, "w3:p2");
+    assert_eq!(started.cwd, CHECKOUT);
+    mock.assert_complete();
+}
+
+#[test]
+fn worktree_open_errors_other_than_not_found_do_not_create() {
+    let mock = MockCli::new(vec![Step::error(
+        &worktree_open_args(&["--no-focus"]),
+        "not_git_worktree",
+    )]);
+    assert!(start_agent(&worktree_opts_start())
+        .unwrap_err()
+        .contains("not_git_worktree"));
+    mock.assert_complete();
+}
+
+#[test]
+fn worktree_response_without_root_pane_does_not_run_agent() {
+    let mock = MockCli::new(vec![
+        Step::error(&worktree_open_args(&["--no-focus"]), "worktree_not_found"),
+        Step::ok(
+            &worktree_create_args(&["--no-focus"]),
+            json!({"result": {"type": "worktree_created",
+                "root_pane": {"workspace_id": "w3", "cwd": CHECKOUT},
+                "workspace": {"workspace_id": "w3"},
+                "worktree": {"branch": "TEST-1", "path": CHECKOUT}}}),
+        ),
+    ]);
+    assert!(start_agent(&worktree_opts_start())
+        .unwrap_err()
+        .contains("root_pane.pane_id"));
+    mock.assert_complete();
+}
+
+#[test]
+fn trusted_repository_flag_is_passed_to_open_and_create() {
+    let mock = MockCli::new(vec![
+        Step::error(
+            &worktree_open_args(&["--focus", "--trust-repository"]),
+            "worktree_not_found",
+        ),
+        Step::ok(
+            &worktree_create_args(&["--focus", "--trust-repository"]),
+            worktree_response("worktree_created", false),
+        ),
+    ]);
+    let wt = WorktreeOpts {
+        trust_repository: true,
+        ..worktree_opts()
+    };
+    let opened = open_or_create_worktree("/tmp/project with spaces", &wt, true).unwrap();
+    assert_eq!(opened.workspace_id, "w3");
+    assert_eq!(opened.pane_id, "w3:p1");
+    assert_eq!(opened.checkout_path, CHECKOUT);
+    assert!(!opened.already_open);
     mock.assert_complete();
 }

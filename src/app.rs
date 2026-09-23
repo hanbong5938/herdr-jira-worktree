@@ -26,6 +26,14 @@ pub enum View {
     NewAgentCwdPicker,
     /// Free-text cwd entry (from "type path…" in the cwd picker).
     NewAgentCwdInput,
+    /// `w`: pick the repo to create the worktree in (no `[worktree]` repo configured).
+    WorktreeRepoPicker,
+    /// `w`: free-text repo path (from "type path…" in the repo picker).
+    WorktreeRepoInput,
+    /// `w`: worktree (branch) name, prefilled from `[worktree].branch`.
+    WorktreeNameInput,
+    /// `w`: optionally start an agent in the new worktree.
+    WorktreeAgentPicker,
     SearchInput,
     JqlInput,
     Help,
@@ -51,6 +59,11 @@ pub enum Resp {
         key: String,
         label: String,
         result: Result<(), String>,
+    },
+    /// `w` without an agent: `result` is the checkout path.
+    WorktreeOpened {
+        branch: String,
+        result: Result<String, String>,
     },
     Children {
         epic: String,
@@ -101,6 +114,15 @@ pub struct App {
     pub cwd_choices: Vec<String>,
     pub cwd_input: String,
 
+    /// `w` flow: validated repo dir the worktree is created from.
+    pub wt_repo: String,
+    /// The repo came from the picker (Esc on the name input returns there).
+    pub wt_repo_asked: bool,
+    /// Worktree name being edited.
+    pub wt_name_input: String,
+    /// Sanitized branch name confirmed on the name input.
+    pub wt_branch: String,
+
     pub search_input: String,
     pub jql_input: String,
     pub last_jql: String,
@@ -111,7 +133,14 @@ pub struct App {
 
 impl App {
     pub fn new(tx: Sender<Resp>) -> Self {
-        let mut app = Self {
+        let mut app = Self::unloaded(tx);
+        app.reload_config();
+        app
+    }
+
+    /// Empty state with the built-in default config; `new` then loads the real one.
+    fn unloaded(tx: Sender<Resp>) -> Self {
+        Self {
             cfg: Config {
                 jira: crate::config::JiraConfig {
                     base_url: String::new(),
@@ -125,6 +154,7 @@ impl App {
                 filters: vec![],
                 search: Default::default(),
                 delegate: Default::default(),
+                worktree: Default::default(),
             },
             client: None,
             tx,
@@ -151,14 +181,16 @@ impl App {
             workspaces_loading: false,
             cwd_choices: vec![],
             cwd_input: String::new(),
+            wt_repo: String::new(),
+            wt_repo_asked: false,
+            wt_name_input: String::new(),
+            wt_branch: String::new(),
             search_input: String::new(),
             jql_input: String::new(),
             last_jql: String::new(),
             detail_scroll: 0,
             toast: None,
-        };
-        app.reload_config();
-        app
+        }
     }
 
     pub fn reload_config(&mut self) {
@@ -459,6 +491,7 @@ impl App {
             focus,
             workspace_id: ws.id.clone(),
             tab_label: key.clone(),
+            worktree: None,
         };
         let place_hint = if placement.eq_ignore_ascii_case("tab") || placement.is_empty() {
             format!("new tab in {ws_label}")
@@ -473,6 +506,114 @@ impl App {
             ),
             false,
         );
+        std::thread::spawn(move || {
+            let result = herdr::start_and_delegate(
+                &opts,
+                &text,
+                submit,
+                delay,
+                startup,
+                wait_ready,
+            )
+            .map(|a| a.label);
+            let label = match &result {
+                Ok(l) => l.clone(),
+                Err(_) => agent_label,
+            };
+            let result = result.map(|_| ());
+            let _ = tx.send(Resp::Delegated { key, label, result });
+        });
+    }
+
+    // ---- `w`: git worktree for the selected issue ----
+
+    /// Resolve the repo from `[worktree]` (per project key, then the default)
+    /// or ask for it; then ask for the worktree name.
+    fn open_worktree(&mut self) {
+        let Some(issue) = self.selected_issue() else { return };
+        let wcfg = &self.cfg.worktree;
+        let configured = wcfg
+            .repos
+            .get(project_key(&issue.key))
+            .filter(|r| !r.trim().is_empty())
+            .or(Some(&wcfg.repo).filter(|r| !r.trim().is_empty()))
+            .cloned();
+        let Some(raw) = configured else {
+            self.wt_repo_asked = true;
+            self.cwd_choices = collect_cwd_choices(&self.cfg, &self.agents);
+            self.picker_sel = 0;
+            self.view = View::WorktreeRepoPicker;
+            return;
+        };
+        self.wt_repo_asked = false;
+        match resolve_cwd(&raw) {
+            Ok(repo) => self.open_worktree_name_input(repo),
+            Err(e) => self.toast(format!("worktree repo: {e}"), true),
+        }
+    }
+
+    /// Repo known: open the name input prefilled from `[worktree].branch`.
+    fn open_worktree_name_input(&mut self, repo: String) {
+        let Some(issue) = self.selected_issue() else { return };
+        let name = render_branch_name(&self.cfg.worktree.branch, issue);
+        self.wt_name_input = name;
+        self.wt_repo = repo;
+        self.view = View::WorktreeNameInput;
+    }
+
+    fn open_worktree_repo_input(&mut self) {
+        let pref = self
+            .cwd_choices
+            .get(self.picker_sel)
+            .or(self.cwd_choices.first())
+            .cloned()
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_default();
+        self.cwd_input = pref;
+        self.view = View::WorktreeRepoInput;
+    }
+
+    /// Open (or create) the worktree without an agent; reported as `WorktreeOpened`.
+    fn open_worktree_only(&mut self, opts: herdr::WorktreeOpts) {
+        let repo = self.wt_repo.clone();
+        let focus = self.cfg.worktree.focus;
+        let branch = opts.branch.clone();
+        let tx = self.tx.clone();
+        self.toast(format!("creating worktree {branch}…"), false);
+        std::thread::spawn(move || {
+            let result =
+                herdr::open_or_create_worktree(&repo, &opts, focus).map(|wt| wt.checkout_path);
+            let _ = tx.send(Resp::WorktreeOpened { branch, result });
+        });
+    }
+
+    /// Start `spawn` inside the worktree, wait until ready, send the Jira prompt.
+    fn start_worktree_agent(&mut self, spawn: SpawnAgent, wt: herdr::WorktreeOpts) {
+        if spawn.command.is_empty() {
+            self.toast(format!("{}: empty command", spawn.name), true);
+            return;
+        }
+        let Some(issue) = self.selected_issue() else { return };
+        let text = build_prompt(&self.cfg, issue);
+        let key = issue.key.clone();
+        let submit = self.cfg.delegate.submit;
+        let delay = self.cfg.delegate.submit_delay_ms;
+        let startup = self.cfg.delegate.startup_delay_ms;
+        let wait_ready = self.cfg.delegate.wait_ready_ms;
+        let agent_label = spawn.name.clone();
+        let hint = format!("worktree {} of {}", wt.branch, short_home(&self.wt_repo));
+        let opts = StartAgentOpts {
+            name: unique_agent_name(&key, &spawn.name),
+            cwd: self.wt_repo.clone(),
+            argv: spawn.command,
+            placement: self.cfg.delegate.placement.clone(),
+            focus: self.cfg.worktree.focus,
+            workspace_id: String::new(),
+            tab_label: key.clone(),
+            worktree: Some(wt),
+        };
+        let tx = self.tx.clone();
+        self.toast(format!("starting {agent_label} for {key} ({hint})…"), false);
         std::thread::spawn(move || {
             let result = herdr::start_and_delegate(
                 &opts,
@@ -605,6 +746,13 @@ impl App {
                 }
                 Err(e) => self.toast(format!("delegate {key}: {e}"), true),
             },
+            Resp::WorktreeOpened { branch, result } => match result {
+                Ok(path) => self.toast(
+                    format!("worktree {branch} ready: {}", short_home(&path)),
+                    false,
+                ),
+                Err(e) => self.toast(format!("worktree {branch}: {e}"), true),
+            },
             Resp::Children { epic, result } => {
                 self.loading_children.remove(&epic);
                 match result {
@@ -646,6 +794,10 @@ impl App {
             View::NewAgentWorkspacePicker => self.keys_new_agent_workspace(key),
             View::NewAgentCwdPicker => self.keys_new_agent_cwd(key),
             View::NewAgentCwdInput => self.keys_cwd_input(key),
+            View::WorktreeRepoPicker => self.keys_worktree_repo(key),
+            View::WorktreeRepoInput => self.keys_worktree_repo_input(key),
+            View::WorktreeNameInput => self.keys_worktree_name(key),
+            View::WorktreeAgentPicker => self.keys_worktree_agent(key),
             View::SearchInput => self.keys_search(key),
             View::JqlInput => self.keys_jql(key),
             View::Help => match key.code {
@@ -710,6 +862,7 @@ impl App {
             }
             KeyCode::Char('s') => self.request_transitions(),
             KeyCode::Char('d') => self.request_agents(),
+            KeyCode::Char('w') => self.open_worktree(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
             KeyCode::Char('?') => self.view = View::Help,
@@ -731,6 +884,7 @@ impl App {
             KeyCode::Char('g') => self.detail_scroll = 0,
             KeyCode::Char('s') => self.request_transitions(),
             KeyCode::Char('d') => self.request_agents(),
+            KeyCode::Char('w') => self.open_worktree(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
             _ => {}
@@ -957,6 +1111,129 @@ impl App {
         }
     }
 
+    fn keys_worktree_repo(&mut self, key: KeyEvent) {
+        // Last row is always "type path…"; rows above are concrete dirs.
+        let n = self.cwd_choices.len() + 1;
+        if let Some(idx) = Self::picker_number(&key, n) {
+            self.pick_worktree_repo_row(idx);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.picker_sel = Self::move_sel(n, self.picker_sel, 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.picker_sel = Self::move_sel(n, self.picker_sel, -1)
+            }
+            KeyCode::Char('/') | KeyCode::Char('e') => self.open_worktree_repo_input(),
+            KeyCode::Enter => self.pick_worktree_repo_row(self.picker_sel),
+            _ => {}
+        }
+    }
+
+    fn pick_worktree_repo_row(&mut self, row: usize) {
+        let Some(dir) = self.cwd_choices.get(row).cloned() else {
+            self.open_worktree_repo_input();
+            return;
+        };
+        match resolve_cwd(&dir) {
+            Ok(repo) => self.open_worktree_name_input(repo),
+            Err(e) => self.toast(format!("repo: {e}"), true),
+        }
+    }
+
+    fn keys_worktree_repo_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.view = View::WorktreeRepoPicker,
+            KeyCode::Enter => match resolve_cwd(&self.cwd_input) {
+                Ok(repo) => self.open_worktree_name_input(repo),
+                Err(e) => self.toast(format!("repo: {e}"), true),
+            },
+            KeyCode::Backspace => {
+                self.cwd_input.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cwd_input.clear();
+            }
+            KeyCode::Char(c) => self.cwd_input.push(c),
+            _ => {}
+        }
+    }
+
+    fn keys_worktree_name(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if self.wt_repo_asked {
+                    // Back to the repo picker with the chosen dir (or "type path…") selected.
+                    self.picker_sel = self
+                        .cwd_choices
+                        .iter()
+                        .position(|c| c == &self.wt_repo)
+                        .unwrap_or(self.cwd_choices.len());
+                    self.view = View::WorktreeRepoPicker;
+                } else {
+                    self.view = View::List;
+                }
+            }
+            KeyCode::Enter => {
+                let branch = sanitize_branch_name(&self.wt_name_input);
+                if branch.is_empty() {
+                    self.toast("worktree name is not a valid git branch name", true);
+                    return;
+                }
+                self.wt_branch = branch;
+                self.picker_sel = 0;
+                self.view = View::WorktreeAgentPicker;
+            }
+            KeyCode::Backspace => {
+                self.wt_name_input.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.wt_name_input.clear();
+            }
+            KeyCode::Char(c) => self.wt_name_input.push(c),
+            _ => {}
+        }
+    }
+
+    /// Row 0 = no agent (just open the worktree); rows 1.. = `[delegate].agents`.
+    fn keys_worktree_agent(&mut self, key: KeyEvent) {
+        let n = self.cfg.delegate.agents.len() + 1;
+        if let Some(idx) = Self::picker_number(&key, n) {
+            self.pick_worktree_agent_row(idx);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::WorktreeNameInput,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.picker_sel = Self::move_sel(n, self.picker_sel, 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.picker_sel = Self::move_sel(n, self.picker_sel, -1)
+            }
+            KeyCode::Enter => self.pick_worktree_agent_row(self.picker_sel),
+            _ => {}
+        }
+    }
+
+    fn pick_worktree_agent_row(&mut self, row: usize) {
+        let spawn = match row.checked_sub(1) {
+            None => None,
+            Some(idx) => match self.cfg.delegate.agents.get(idx).cloned() {
+                Some(spawn) => Some(spawn),
+                None => return,
+            },
+        };
+        let Some(issue) = self.selected_issue() else { return };
+        let opts = worktree_opts(&self.cfg, issue, &self.wt_branch);
+        self.view = View::List;
+        match spawn {
+            None => self.open_worktree_only(opts),
+            Some(spawn) => self.start_worktree_agent(spawn, opts),
+        }
+    }
+
     fn keys_search(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.view = View::List,
@@ -1055,6 +1332,140 @@ mod tests {
         issue.description = "  ".into();
         assert_eq!(build_prompt(&cfg, &issue), "(no description)");
     }
+
+    fn branch_for(template: &str, summary: &str) -> String {
+        let mut issue = test_issue();
+        issue.summary = summary.into();
+        render_branch_name(template, &issue)
+    }
+
+    #[test]
+    fn branch_default_template_is_the_key() {
+        assert_eq!(branch_for("{key}", "Fix login"), "PROJ-7");
+        assert_eq!(branch_for("{type}/{key}", "Fix login"), "bug/PROJ-7");
+    }
+
+    #[test]
+    fn branch_slug_collapses_punctuation() {
+        assert_eq!(
+            branch_for("{key}-{slug}", "Fix: login  crash (on iOS 17)!"),
+            "PROJ-7-fix-login-crash-on-ios-17"
+        );
+    }
+
+    #[test]
+    fn branch_non_ascii_summary_collapses_to_key() {
+        assert_eq!(branch_for("{key}-{slug}", "로그인 버그 수정"), "PROJ-7");
+    }
+
+    #[test]
+    fn branch_hostile_templates_become_valid_refs() {
+        assert_eq!(branch_for("-feature/..x @{y}.lock/", ""), "feature");
+        assert_eq!(branch_for("{key}~^:?*[\\ name.lock", ""), "PROJ-7-name");
+        assert_eq!(branch_for("a.lock/b..c//d.", ""), "a/b.c/d");
+        assert_eq!(branch_for("@", ""), "");
+        assert_eq!(branch_for("{slug}", "!!!"), "");
+    }
+
+    #[test]
+    fn branch_long_slug_is_cut_at_a_word_boundary() {
+        assert_eq!(
+            branch_for(
+                "{key}-{slug}",
+                "Implement the extremely comprehensive authentication refactoring plan"
+            ),
+            "PROJ-7-implement-the-extremely-comprehensive"
+        );
+    }
+
+    /// App on the issue list with `test_issue` selected; no herdr calls.
+    fn list_app() -> App {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::unloaded(tx);
+        app.cfg = test_cfg("{key}", 0);
+        app.cfg.delegate.agents = vec![SpawnAgent {
+            name: "claude".into(),
+            command: vec!["claude".into()],
+        }];
+        app.issues = vec![test_issue()];
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn temp_dir() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn project_key_is_everything_before_the_last_dash() {
+        assert_eq!(project_key("PROJ-1666"), "PROJ");
+        assert_eq!(project_key("A-B-12"), "A-B");
+    }
+
+    #[test]
+    fn worktree_with_configured_repo_opens_prefilled_name_input() {
+        let mut app = list_app();
+        app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.view, View::WorktreeNameInput);
+        assert_eq!(app.wt_name_input, "PROJ-7");
+        assert_eq!(app.wt_repo, resolve_cwd(&temp_dir()).unwrap());
+        assert!(!app.wt_repo_asked);
+    }
+
+    #[test]
+    fn worktree_without_repo_asks_for_it() {
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.view, View::WorktreeRepoPicker);
+        assert!(app.wt_repo_asked);
+    }
+
+    #[test]
+    fn worktree_name_must_sanitize_to_a_branch() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        app.wt_name_input = "@".into();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeNameInput);
+        assert!(matches!(&app.toast, Some((_, true, _))));
+
+        app.wt_name_input = "feature/x y".into();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        assert_eq!(app.wt_branch, "feature/x-y");
+    }
+
+    #[test]
+    fn worktree_esc_walks_back_one_step() {
+        // Repo from config: agent picker -> name input (edit kept) -> List.
+        let mut app = list_app();
+        app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
+        press(&mut app, KeyCode::Char('w'));
+        app.wt_name_input = "feature/x y".into();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeNameInput);
+        assert_eq!(app.wt_name_input, "feature/x y");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::List);
+
+        // Repo asked: name input -> repo picker.
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.view, View::WorktreeRepoInput);
+        app.cwd_input = temp_dir();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeNameInput);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeRepoPicker);
+    }
 }
 
 /// Fill the delegate prompt template with issue fields.
@@ -1081,6 +1492,139 @@ pub fn build_prompt(cfg: &Config, issue: &Issue) -> String {
         .replace("{labels}", &issue.labels.join(", "))
         .trim()
         .to_string()
+}
+
+/// Longest `{slug}` / `{type}` substitution in worktree templates.
+const SLUG_MAX: usize = 40;
+
+/// Git-branch name for an issue from a `[worktree].branch` template.
+/// Placeholders: {key} {type} {slug}. The result passes
+/// `git check-ref-format --branch`; empty when nothing valid remains.
+pub fn render_branch_name(template: &str, issue: &Issue) -> String {
+    sanitize_branch_name(&fill_issue_placeholders(template, issue))
+}
+
+/// Fill a worktree path/label template: {key} {type} {slug} {branch}.
+fn fill_worktree_template(template: &str, issue: &Issue, branch: &str) -> String {
+    fill_issue_placeholders(template, issue).replace("{branch}", branch)
+}
+
+fn fill_issue_placeholders(template: &str, issue: &Issue) -> String {
+    template
+        .replace("{key}", &issue.key)
+        .replace("{type}", &slugify(&issue.issue_type, SLUG_MAX))
+        .replace("{slug}", &slugify(&issue.summary, SLUG_MAX))
+}
+
+/// Lowercase ASCII alphanumerics; every other run of chars becomes one '-'.
+/// Longer than `max` → cut back to the last '-' boundary within `max`.
+fn slugify(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max + 1));
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_end_matches('-');
+    if out.len() <= max {
+        return out.to_string();
+    }
+    // ASCII only, so byte indices are char boundaries.
+    let head = &out[..max];
+    let cut = if out.as_bytes()[max] == b'-' {
+        head
+    } else {
+        head.rfind('-').map_or(head, |i| &head[..i])
+    };
+    cut.trim_end_matches('-').to_string()
+}
+
+/// Rewrite `raw` so it satisfies `git check-ref-format --branch`.
+fn sanitize_branch_name(raw: &str) -> String {
+    let mut s: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    loop {
+        let before = s.clone();
+        s = s.replace("@{", "-");
+        while s.contains("..") {
+            s = s.replace("..", ".");
+        }
+        s = collapse_runs(&s, '-');
+        s = collapse_runs(&s, '/');
+        s = s
+            .split('/')
+            .filter(|comp| !comp.starts_with('.'))
+            .map(|comp| comp.strip_suffix(".lock").unwrap_or(comp))
+            .collect::<Vec<_>>()
+            .join("/");
+        s = s
+            .trim_start_matches(['-', '/', '.'])
+            .trim_end_matches(['/', '.', '-'])
+            .to_string();
+        if s == before {
+            break;
+        }
+    }
+    if s == "@" || s == "HEAD" {
+        String::new()
+    } else {
+        s
+    }
+}
+
+fn collapse_runs(s: &str, ch: char) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if !(c == ch && out.ends_with(ch)) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Expand and validate a directory (worktree repo): non-empty existing directory.
+fn resolve_cwd(cwd_raw: &str) -> Result<String, String> {
+    let cwd = herdr::expand_path(cwd_raw);
+    if cwd.is_empty() {
+        return Err("path is empty".into());
+    }
+    if !Path::new(&cwd).is_dir() {
+        return Err(format!("not a directory: {cwd}"));
+    }
+    Ok(cwd)
+}
+
+/// Jira project key of an issue key: everything before the last '-'
+/// ("PROJ-1666" -> "PROJ").
+fn project_key(issue_key: &str) -> &str {
+    issue_key.rsplit_once('-').map_or(issue_key, |(project, _)| project)
+}
+
+/// `herdr worktree` options for `issue` on `branch` from `[worktree]`.
+fn worktree_opts(cfg: &Config, issue: &Issue, branch: &str) -> herdr::WorktreeOpts {
+    let wcfg = &cfg.worktree;
+    let path = if wcfg.path.trim().is_empty() {
+        String::new()
+    } else {
+        herdr::expand_path(&fill_worktree_template(wcfg.path.trim(), issue, branch))
+    };
+    herdr::WorktreeOpts {
+        branch: branch.to_string(),
+        base: wcfg.base.trim().to_string(),
+        path,
+        label: fill_worktree_template(wcfg.label.trim(), issue, branch),
+        trust_repository: wcfg.trust_repository,
+    }
 }
 
 /// Build cwd options: configured default, unique cwds from running agents,

@@ -1,8 +1,9 @@
 //! Plugin configuration: loaded from the herdr-managed plugin config dir
 //! (`HERDR_PLUGIN_CONFIG_DIR`, falling back to
-//! `~/.config/herdr/plugins/config/herdr-jira/config.toml` for standalone runs).
+//! `~/.config/herdr/plugins/config/han.jira-worktree/config.toml` for standalone runs).
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -15,6 +16,10 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub delegate: DelegateConfig,
+    /// Settings for `w` (create a git worktree for the selected issue);
+    /// TOML table `[worktree]`.
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +103,52 @@ pub struct DelegateConfig {
     pub wait_ready_ms: u64,
 }
 
+/// Settings for `w`: create (or reopen) a git worktree for an issue, then
+/// optionally start an agent in it (TOML table `[worktree]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorktreeConfig {
+    /// Default repo for `w` when no per-project entry matches; empty = ask.
+    #[serde(default)]
+    pub repo: String,
+    /// Per Jira project key repo dirs, e.g. PROJ = "~/workspace/project".
+    #[serde(default)]
+    pub repos: HashMap<String, String>,
+    /// Prefill for the worktree name input. Placeholders {key} {slug} {type}. Default "{key}".
+    #[serde(default = "default_worktree_branch")]
+    pub branch: String,
+    /// Base ref for NEW branches; empty = herdr default (HEAD of the repo).
+    #[serde(default)]
+    pub base: String,
+    /// Checkout path template ({key} {slug} {type} {branch}); empty = herdr default
+    /// (`<worktrees.directory>/<repo>/<branch-slug>`). `~`/$HOME expanded.
+    #[serde(default)]
+    pub path: String,
+    /// Workspace label template ({key} {slug} {type} {branch}). Default "{key}".
+    #[serde(default = "default_worktree_label")]
+    pub label: String,
+    /// Pass --trust-repository. Only enable for repositories you have verified.
+    #[serde(default)]
+    pub trust_repository: bool,
+    /// Focus the worktree workspace after opening it. Default true.
+    #[serde(default = "default_true")]
+    pub focus: bool,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            repo: String::new(),
+            repos: HashMap::new(),
+            branch: default_worktree_branch(),
+            base: String::new(),
+            path: String::new(),
+            label: default_worktree_label(),
+            trust_repository: false,
+            focus: true,
+        }
+    }
+}
+
 impl Default for DelegateConfig {
     fn default() -> Self {
         Self {
@@ -142,6 +193,12 @@ fn default_startup_delay() -> u64 {
 fn default_wait_ready() -> u64 {
     30_000
 }
+fn default_worktree_branch() -> String {
+    "{key}".into()
+}
+fn default_worktree_label() -> String {
+    "{key}".into()
+}
 fn default_spawn_agents() -> Vec<SpawnAgent> {
     ["claude", "codex", "grok", "cursor", "opencode"]
         .into_iter()
@@ -166,7 +223,7 @@ pub fn config_path() -> PathBuf {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/herdr/plugins/config/herdr-jira/config.toml")
+    PathBuf::from(home).join(".config/herdr/plugins/config/han.jira-worktree/config.toml")
 }
 
 impl Config {
@@ -243,7 +300,9 @@ mod tests {
             .replace("focus_new = false", "focus_new = true")
             .replace("startup_delay_ms = 1500", "startup_delay_ms = 123")
             .replace("wait_ready_ms = 30000", "wait_ready_ms = 456")
-            .replace("submit_delay_ms = 500", "submit_delay_ms = 789");
+            .replace("submit_delay_ms = 500", "submit_delay_ms = 789")
+            .replace("# repo = \"~/workspace/project\"", "repo = \"~/src/app\"")
+            .replace("trust_repository = false", "trust_repository = true");
         let cfg: Config = toml::from_str(&raw).unwrap();
         assert_eq!(cfg.delegate.placement, "right");
         assert!(cfg.delegate.focus_new);
@@ -252,5 +311,61 @@ mod tests {
         // Old configs remain parseable even though this setting is ignored.
         assert_eq!(cfg.delegate.submit_delay_ms, 789);
         assert_eq!(cfg.delegate.agents.len(), 3);
+        // [worktree] after the agents is its own top-level table.
+        assert_eq!(cfg.worktree.repo, "~/src/app");
+        assert!(cfg.worktree.trust_repository);
+        assert_eq!(cfg.worktree.branch, "{key}");
+        assert!(cfg.worktree.focus);
+    }
+
+    const MINIMAL: &str = r#"
+[jira]
+base_url = "https://example.atlassian.net"
+
+[delegate]
+placement = "tab"
+"#;
+
+    #[test]
+    fn missing_worktree_table_uses_defaults() {
+        let cfg: Config = toml::from_str(MINIMAL).unwrap();
+        let wt = &cfg.worktree;
+        assert_eq!(wt.repo, "");
+        assert!(wt.repos.is_empty());
+        assert_eq!(wt.branch, "{key}");
+        assert_eq!(wt.label, "{key}");
+        assert_eq!(wt.base, "");
+        assert_eq!(wt.path, "");
+        assert!(!wt.trust_repository);
+        assert!(wt.focus);
+    }
+
+    #[test]
+    fn partial_worktree_table_keeps_other_defaults() {
+        let raw = format!(
+            "{MINIMAL}\n[worktree]\nrepo = \"~/src/app\"\nbranch = \"feature/{{key}}-{{slug}}\"\n\n[worktree.repos]\nPROJ = \"~/w/backend\"\n"
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        let wt = &cfg.worktree;
+        assert_eq!(wt.repo, "~/src/app");
+        assert_eq!(wt.branch, "feature/{key}-{slug}");
+        assert_eq!(wt.repos.len(), 1);
+        assert_eq!(wt.repos.get("PROJ").map(String::as_str), Some("~/w/backend"));
+        assert!(wt.focus);
+        assert!(!wt.trust_repository);
+        assert_eq!(wt.label, "{key}");
+        assert_eq!(wt.base, "");
+        assert_eq!(wt.path, "");
+        assert_eq!(cfg.delegate.placement, "tab");
+    }
+
+    #[test]
+    fn legacy_delegate_worktree_table_is_ignored() {
+        let raw = format!(
+            "{MINIMAL}\n[delegate.worktree]\nenabled = true\npreselect = true\nbranch = \"legacy/{{key}}\"\n"
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(cfg.delegate.placement, "tab");
+        assert_eq!(cfg.worktree.branch, "{key}");
     }
 }

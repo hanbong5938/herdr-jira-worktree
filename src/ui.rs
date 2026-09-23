@@ -35,6 +35,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::NewAgentWorkspacePicker => draw_new_agent_workspace_picker(f, app),
         View::NewAgentCwdPicker => draw_new_agent_cwd_picker(f, app),
         View::NewAgentCwdInput => draw_cwd_input(f, app),
+        View::WorktreeRepoPicker => draw_worktree_repo_picker(f, app),
+        View::WorktreeRepoInput => draw_worktree_repo_input(f, app),
+        View::WorktreeNameInput => draw_worktree_name_input(f, app),
+        View::WorktreeAgentPicker => draw_worktree_agent_picker(f, app),
         View::SearchInput => draw_search(f, app),
         View::JqlInput => draw_jql(f, app),
         View::Help => draw_help(f),
@@ -205,22 +209,27 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     let hints = match app.view {
-        View::Detail => "Esc back  ·  j/k scroll  ·  s status  ·  d delegate  ·  o browser  ·  z zoom",
+        View::Detail => "Esc back  ·  j/k scroll  ·  s status  ·  d delegate  ·  w worktree  ·  o browser  ·  z zoom",
         View::SearchInput => "Enter search  ·  Esc cancel",
         View::JqlInput => "Enter run JQL  ·  Ctrl-U clear  ·  Esc cancel",
         View::NewAgentCwdInput => "Enter start  ·  Ctrl-U clear  ·  Esc back",
+        View::WorktreeRepoInput | View::WorktreeNameInput => {
+            "Enter next  ·  Ctrl-U clear  ·  Esc back"
+        }
         View::AgentPicker => {
             "1-9 pick  ·  n new agent  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
         View::NewAgentTypePicker
         | View::NewAgentWorkspacePicker
-        | View::NewAgentCwdPicker => {
+        | View::NewAgentCwdPicker
+        | View::WorktreeRepoPicker
+        | View::WorktreeAgentPicker => {
             "1-9 pick  ·  j/k move  ·  Enter select  ·  Esc back"
         }
         View::FilterPicker | View::TransitionPicker => {
             "1-9 quick pick  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
-        _ => "Enter open  ·  →/← epic  ·  f filters  ·  / search  ·  s status  ·  d delegate  ·  z zoom  ·  r refresh  ·  ? help  ·  q quit",
+        _ => "Enter open  ·  →/← epic  ·  f filters  ·  / search  ·  s status  ·  d delegate  ·  w worktree  ·  z zoom  ·  r refresh  ·  ? help  ·  q quit",
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
@@ -521,6 +530,80 @@ fn draw_cwd_input(f: &mut Frame, app: &App) {
     );
 }
 
+fn worktree_issue_key(app: &App) -> String {
+    app.selected_issue()
+        .map(|i| i.key.clone())
+        .unwrap_or_default()
+}
+
+fn draw_worktree_repo_picker(f: &mut Frame, app: &App) {
+    let title = format!("repo for worktree of {}", worktree_issue_key(app));
+    let n = app.cwd_choices.len() + 1;
+    let h = (n as u16 + 2).max(4);
+    let inner = popup(f, &title, 70, h);
+    let mut items: Vec<ListItem> = app
+        .cwd_choices
+        .iter()
+        .enumerate()
+        .map(|(i, p)| ListItem::new(Line::from(vec![num_span(i), Span::raw(short_path(p))])))
+        .collect();
+    items.push(ListItem::new(Line::from(vec![
+        num_span(app.cwd_choices.len()),
+        Span::styled(
+            "type path…",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  (/)", Style::new().fg(Color::DarkGray)),
+    ])));
+    render_picker_list(f, inner, items, app.picker_sel);
+}
+
+fn draw_worktree_repo_input(f: &mut Frame, app: &App) {
+    let title = format!("repo for worktree of {}", worktree_issue_key(app));
+    let inner = popup(f, &title, 75, 3);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(app.cwd_input.clone()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ])),
+        inner,
+    );
+}
+
+fn draw_worktree_name_input(f: &mut Frame, app: &App) {
+    let title = format!("worktree name for {}", worktree_issue_key(app));
+    let inner = popup(f, &title, 75, 3);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(app.wt_name_input.clone()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ])),
+        inner,
+    );
+}
+
+fn draw_worktree_agent_picker(f: &mut Frame, app: &App) {
+    let title = format!("worktree {} — start an agent?", app.wt_branch);
+    let agents = &app.cfg.delegate.agents;
+    let h = (agents.len() as u16 + 3).max(3);
+    let inner = popup(f, &title, 60, h);
+    let mut items = vec![ListItem::new(Line::from(vec![
+        num_span(0),
+        Span::styled(
+            "no agent — just open the worktree",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ]))];
+    items.extend(agents.iter().enumerate().map(|(i, a)| {
+        ListItem::new(Line::from(vec![
+            num_span(i + 1),
+            Span::styled(format!("{:<12}", a.name), Style::new().fg(ACCENT).bold()),
+            Span::styled(a.command.join(" "), Style::new().fg(Color::DarkGray)),
+        ]))
+    }));
+    render_picker_list(f, inner, items, app.picker_sel);
+}
+
 /// "1. " index prefix shown in pickers — rows past 9 have no hotkey.
 fn num_span(i: usize) -> Span<'static> {
     let text = if i < 9 {
@@ -564,7 +647,7 @@ fn draw_jql(f: &mut Frame, app: &App) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let inner = popup(f, "help", 60, 20);
+    let inner = popup(f, "help", 60, 21);
     let rows = [
         ("j/k ↑/↓", "move / scroll"),
         ("Enter", "open issue details"),
@@ -576,6 +659,7 @@ fn draw_help(f: &mut Frame) {
         ("s", "change issue status"),
         ("d", "delegate issue to an agent"),
         ("n", "in delegate picker: start a new agent"),
+        ("w", "create git worktree for issue (name, then optional agent)"),
         ("o", "open issue in browser"),
         ("z", "zoom pane (fullscreen toggle)"),
         ("r", "refresh current filter"),
@@ -602,7 +686,7 @@ fn draw_fatal(f: &mut Frame, err: &str) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Red))
         .padding(Padding::uniform(1))
-        .title(Span::styled(" herdr-jira: configuration ", Style::new().fg(Color::Red).bold()));
+        .title(Span::styled(" herdr-jira-worktree: configuration ", Style::new().fg(Color::Red).bold()));
     let text = format!("{err}\n\nR — retry after fixing the config, q — quit");
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(block),

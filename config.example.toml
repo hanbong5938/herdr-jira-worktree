@@ -1,8 +1,8 @@
-# herdr-jira configuration.
+# herdr-jira (han.jira-worktree) configuration.
 #
 # Copy this file to the plugin config dir and edit it:
-#   mkdir -p "$(herdr plugin config-dir herdr-jira)"
-#   cp config.example.toml "$(herdr plugin config-dir herdr-jira)/config.toml"
+#   mkdir -p "$(herdr plugin config-dir han.jira-worktree)"
+#   cp config.example.toml "$(herdr plugin config-dir han.jira-worktree)/config.toml"
 #
 # The running pane reloads the config on `R` (capital R).
 
@@ -116,3 +116,57 @@ command = ["codex"]
 [[delegate.agents]]
 name = "grok"
 command = ["grok"]
+
+# --- `w`: create a git worktree for the selected issue ---
+# Press `w` on an issue (list or detail view) to create a git worktree for it
+# via herdr (`herdr worktree`). It opens as a NEW workspace grouped with the
+# repo's workspace. If a worktree for the chosen name already exists it is
+# reopened (or its open workspace reused) instead of being recreated.
+#
+# Flow:
+#   1. Repository: [worktree.repos] entry for the issue's project key (e.g.
+#      "PROJ" for PROJ-1666), else `repo`, else you are asked (directory
+#      picker, or type a path).
+#   2. Worktree/branch name: an input prefilled from `branch`; edit it and
+#      press Enter.
+#   3. Agent: "no agent" just opens the worktree; picking one of the
+#      [[delegate.agents]] starts it in the worktree and sends it the Jira
+#      prompt, exactly like `d` (uses the [delegate] prompt/submit/delay
+#      settings).
+#
+# Template placeholders: {key} (issue key), {slug} (summary slug),
+# {type} (issue type); path and label also accept {branch}.
+#
+# This table must come AFTER the [[delegate.agents]] entries above.
+[worktree]
+# Default repository for `w` (empty/unset = ask each time). `~` and $HOME are
+# expanded.
+# repo = "~/workspace/project"
+
+# Prefill for the worktree (branch) name input. The branch is created, or
+# checked out if it already exists.
+branch = "{key}"
+# branch = "feature/{key}-{slug}"
+
+# Base ref for NEW branches (default: the repo's HEAD).
+# base = "origin/main"
+
+# Checkout directory (default: <worktrees.directory>/<repo>/<branch-slug>
+# from herdr's config). `~` and $HOME are expanded.
+# path = "~/worktrees/{branch}"
+
+# Label of the new herdr workspace.
+label = "{key}"
+
+# Pass --trust-repository so herdr skips its repository trust prompt.
+# Only enable this for repositories you have verified.
+trust_repository = false
+
+# Focus the worktree workspace after opening it.
+focus = true
+
+# Per Jira project key repositories; take precedence over `repo`.
+# Keep this sub-table LAST: keys after it belong to [worktree.repos].
+# [worktree.repos]
+# PROJ = "~/workspace/project"
+# WEB = "~/workspace/web"

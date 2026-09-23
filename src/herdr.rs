@@ -28,9 +28,40 @@ pub struct StartAgentOpts {
     /// "tab" | "right" | "down".
     pub placement: String,
     pub focus: bool,
+    /// Workspace for tab/split placement; required there. Ignored (may be
+    /// empty) when `worktree` is Some: herdr opens the worktree in its own
+    /// workspace.
     pub workspace_id: String,
     /// Optional label for a newly created tab (usually the issue key).
     pub tab_label: String,
+    /// Some = run the agent in a git worktree of `cwd` (the repo dir); `placement` is ignored.
+    pub worktree: Option<WorktreeOpts>,
+}
+
+/// How to open or create the git worktree a new agent runs in.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeOpts {
+    /// Branch name; already rendered and sanitized, non-empty.
+    pub branch: String,
+    /// Base ref for a new branch; empty = omit `--base` (herdr default).
+    pub base: String,
+    /// Checkout path, already expanded; empty = omit `--path` (herdr default).
+    pub path: String,
+    /// Workspace label; empty = omit `--label`.
+    pub label: String,
+    /// Append `--trust-repository` to both `worktree open` and `worktree create`.
+    pub trust_repository: bool,
+}
+
+/// A worktree workspace returned by `herdr worktree open|create`.
+#[derive(Debug, Clone)]
+pub struct OpenedWorktree {
+    pub workspace_id: String,
+    /// Root pane of the worktree workspace.
+    pub pane_id: String,
+    pub checkout_path: String,
+    /// The workspace was already open; its root pane may be running an agent.
+    pub already_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,15 +116,19 @@ fn parse_response(
     // Do not include command arguments: they may contain the entire Jira prompt.
     let command = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
     let parsed = serde_json::from_str::<Value>(stdout);
-    // API failures are JSON on stdout, even when the process exits non-zero.
-    if let Ok(v) = &parsed {
-        if !v["error"].is_null() {
-            let error = &v["error"];
-            return Err(CliError {
-                code: error["code"].as_str().map(str::to_string),
-                message: format!("herdr {command} failed: {error}"),
-            });
-        }
+    // API failures are JSON on stdout (older herdr) or stderr (herdr 0.9.1),
+    // even when the process exits non-zero.
+    let stderr_json = serde_json::from_str::<Value>(stderr.trim()).ok();
+    let api_error = [parsed.as_ref().ok(), stderr_json.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|v| &v["error"])
+        .find(|e| !e.is_null());
+    if let Some(error) = api_error {
+        return Err(CliError {
+            code: error["code"].as_str().map(str::to_string),
+            message: format!("herdr {command} failed: {error}"),
+        });
     }
     if !success {
         let detail = if stderr.trim().is_empty() {
@@ -307,12 +342,90 @@ fn run_agent_in_pane(
     })
 }
 
+/// Open the worktree for `wt.branch` in the repo at `repo_cwd`, creating it
+/// (and the branch, if needed) only when herdr reports `worktree_not_found`.
+/// Any other error is returned as-is; nothing is retried with extra trust.
+pub fn open_or_create_worktree(
+    repo_cwd: &str,
+    wt: &WorktreeOpts,
+    focus: bool,
+) -> Result<OpenedWorktree, String> {
+    if repo_cwd.trim().is_empty() {
+        return Err("worktree: repository directory is empty".into());
+    }
+    if wt.branch.trim().is_empty() {
+        return Err("worktree: branch name is empty".into());
+    }
+    let worktree_args = |action: &str| -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "worktree".into(),
+            action.into(),
+            "--cwd".into(),
+            repo_cwd.into(),
+            "--branch".into(),
+            wt.branch.clone(),
+        ];
+        if action == "create" {
+            for (flag, value) in [("--base", &wt.base), ("--path", &wt.path)] {
+                if !value.is_empty() {
+                    args.push(flag.into());
+                    args.push(value.clone());
+                }
+            }
+        }
+        if !wt.label.is_empty() {
+            args.push("--label".into());
+            args.push(wt.label.clone());
+        }
+        args.push(if focus { "--focus" } else { "--no-focus" }.into());
+        if wt.trust_repository {
+            args.push("--trust-repository".into());
+        }
+        args
+    };
+    let open = worktree_args("open");
+    let open_refs: Vec<&str> = open.iter().map(|s| s.as_str()).collect();
+    let v = match run(&open_refs) {
+        Ok(v) => v,
+        Err(e) if e.code.as_deref() == Some("worktree_not_found") => {
+            run_owned(&worktree_args("create"))?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    parse_opened_worktree(&v["result"])
+}
+
+fn parse_opened_worktree(result: &Value) -> Result<OpenedWorktree, String> {
+    let non_empty = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let root = &result["root_pane"];
+    let pane_id = non_empty(&root["pane_id"])
+        .ok_or_else(|| format!("worktree: no root_pane.pane_id in response: {result}"))?;
+    let workspace_id = non_empty(&result["workspace"]["workspace_id"])
+        .or_else(|| non_empty(&root["workspace_id"]))
+        .ok_or_else(|| format!("worktree: no workspace_id in response: {result}"))?;
+    let checkout_path = non_empty(&result["worktree"]["path"])
+        .or_else(|| non_empty(&result["workspace"]["worktree"]["checkout_path"]))
+        .or_else(|| non_empty(&root["cwd"]))
+        .unwrap_or_default();
+    Ok(OpenedWorktree {
+        workspace_id,
+        pane_id,
+        checkout_path,
+        already_open: result["already_open"].as_bool().unwrap_or(false),
+    })
+}
+
 /// Spawn a new agent. Returns the agent identity we can later send to.
 ///
 /// - `placement = "tab"`: create a new tab and run the agent **in its root
 ///   pane** (one terminal).
 /// - `placement = "right"|"down"`: split a pane in the selected workspace,
 ///   then run the command in the new shell pane.
+/// - `worktree = Some(..)`: `placement` is ignored. Open (or create) the git
+///   worktree of `cwd` as its own herdr workspace and run the agent in its
+///   fresh root pane; if that workspace was already open, run it in a new tab
+///   there instead of touching the existing root pane. The agent's cwd is the
+///   checkout path. `workspace_id` is ignored and may be empty.
 pub fn start_agent(opts: &StartAgentOpts) -> Result<HerdrAgent, String> {
     if opts.argv.is_empty() {
         return Err("agent command is empty".into());
@@ -320,19 +433,30 @@ pub fn start_agent(opts: &StartAgentOpts) -> Result<HerdrAgent, String> {
     if opts.name.trim().is_empty() {
         return Err("agent name is empty".into());
     }
+
+    let tab_label = if opts.tab_label.is_empty() {
+        opts.name.as_str()
+    } else {
+        opts.tab_label.as_str()
+    };
+
+    if let Some(wt_opts) = &opts.worktree {
+        let wt = open_or_create_worktree(&opts.cwd, wt_opts, opts.focus)?;
+        let pane_id = if wt.already_open {
+            create_tab(&wt.workspace_id, &wt.checkout_path, tab_label, opts.focus)?.pane_id
+        } else {
+            wt.pane_id
+        };
+        return run_agent_in_pane(&pane_id, &opts.name, &opts.argv, &wt.checkout_path);
+    }
+
     if opts.workspace_id.trim().is_empty() {
         return Err("workspace is empty".into());
     }
-
     let placement = opts.placement.trim().to_ascii_lowercase();
 
     if placement == "tab" || placement.is_empty() {
-        let label = if opts.tab_label.is_empty() {
-            opts.name.as_str()
-        } else {
-            opts.tab_label.as_str()
-        };
-        let tab = create_tab(&opts.workspace_id, &opts.cwd, label, opts.focus)?;
+        let tab = create_tab(&opts.workspace_id, &opts.cwd, tab_label, opts.focus)?;
         return run_agent_in_pane(&tab.pane_id, &opts.name, &opts.argv, &opts.cwd);
     }
 

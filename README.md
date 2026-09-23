@@ -1,4 +1,7 @@
-# herdr-jira
+# herdr-jira-worktree
+
+Fork of [a2u/herdr-jira](https://github.com/a2u/herdr-jira) by Vitalii Rudnykh,
+adding a `w` key that checks out a Jira issue into a fresh git worktree.
 
 A Jira TUI that lives in a [herdr](https://herdr.dev) pane: browse issues through
 configurable JQL filters, search, change issue status, and delegate an issue to
@@ -34,6 +37,9 @@ template (issue key, summary, description, link, …).
   (configurable). Or choose **+ start new agent…** (`n`) to pick an agent type
   and working directory — herdr runs it via `pane run` and the same Jira
   prompt is sent as soon as the agent is ready.
+- **Worktree** — `w` creates a git worktree for the selected issue: edit the
+  name (prefilled with the issue key), then optionally start an agent in it
+  that receives the Jira prompt.
 
 Works with Jira Cloud (email + API token) and Jira Server / Data Center
 (personal access token). Cloud's newer `/rest/api/2/search/jql` endpoint is
@@ -43,22 +49,27 @@ used when available, with automatic fallback to the classic `/rest/api/2/search`
 
 Requires herdr **0.8.0+** and a Rust toolchain (https://rustup.rs) at install time.
 
+This fork (plugin id `han.jira-worktree`, with the `w` worktree key) installs with:
+
 ```sh
-herdr plugin install a2u/herdr-jira
+herdr plugin install hanbong5938/herdr-jira-worktree
 ```
 
 or for local development:
 
 ```sh
-git clone git@github.com:a2u/herdr-jira.git
-herdr plugin link ./herdr-jira
+git clone git@github.com:hanbong5938/herdr-jira-worktree.git
+herdr plugin link ./herdr-jira-worktree
 ```
+
+The upstream plugin (`a2u/herdr-jira`, id `herdr-jira`) is a separate plugin; both
+can be installed side by side.
 
 ## Configure
 
 ```sh
-mkdir -p "$(herdr plugin config-dir herdr-jira)"
-cp config.example.toml "$(herdr plugin config-dir herdr-jira)/config.toml"
+mkdir -p "$(herdr plugin config-dir han.jira-worktree)"
+cp config.example.toml "$(herdr plugin config-dir han.jira-worktree)/config.toml"
 ```
 
 Edit `config.toml`:
@@ -128,12 +139,12 @@ or bind a key in `~/.config/herdr/config.toml`:
 [[keys.command]]              # open in a split beside your work
 key = "prefix+j"
 type = "plugin_action"
-command = "herdr-jira.open-jira"
+command = "han.jira-worktree.open-jira"
 
 [[keys.command]]              # …or in its own tab
 key = "prefix+shift+j"
 type = "plugin_action"
-command = "herdr-jira.open-jira-tab"
+command = "han.jira-worktree.open-jira-tab"
 ```
 
 (then `herdr server reload-config`)
@@ -150,6 +161,7 @@ command = "herdr-jira.open-jira-tab"
 | `J` | run a custom JQL query (prefilled with the current one) |
 | `s` | change issue status |
 | `d` | delegate issue to a running agent, or start a new one |
+| `w` | create a git worktree for the issue (name, then optional agent) |
 | `n` | in the delegate picker: start a new agent |
 | `1`–`9` | quick pick inside any popup (agents, transitions, filters) |
 | `o` | open issue in the browser |
@@ -203,6 +215,69 @@ and idle share a single `wait_ready_ms` budget. If readiness fails, the prompt
 is **not sent** and an error is shown. `wait_ready_ms = 0` explicitly disables
 this check; it is not recommended for cold agent starts.
 
+## Worktrees (`w`)
+
+`w` (from the issue list or the issue details) creates a git worktree for the
+issue in three steps; `Esc` goes back one step:
+
+1. **Repo** — `[worktree.repos]` by project key (`PROJ` for `PROJ-1666`), else
+   `[worktree].repo`, else you are asked: the same directory list as for a new
+   agent, or **type path…**.
+2. **Name** — prefilled from the `branch` template (default `{key}`); edit it
+   freely (`Ctrl-U` clears). On `Enter` it is sanitized into a valid git branch
+   name.
+3. **Agent** — **no agent** just opens the worktree workspace; or pick an agent
+   from `[[delegate.agents]]` to start it there and send the Jira prompt,
+   exactly like `d` (same `[delegate]` prompt/submit/readiness settings).
+
+Add a `[worktree]` table at the end of `config.toml` (after `[[delegate.agents]]`):
+
+```toml
+[worktree]
+repo = "~/workspace/platform"          # default repo; empty/unset = ask
+branch = "{key}"                       # name prefill, e.g. "{type}/{key}-{slug}"
+base = "origin/main"                   # base ref for new branches (default: HEAD)
+focus = true                           # focus the worktree workspace
+# path = "~/worktrees/{branch}"        # checkout path (default: herdr's worktrees dir)
+# label = "{key}"                      # workspace label
+# trust_repository = false             # passes --trust-repository; verified repos only
+
+[worktree.repos]                       # per Jira project key
+PROJ = "~/workspace/project"
+```
+
+### Worktree checkout
+
+The repo directory must be inside a git repo. The plugin first tries to open an
+existing worktree for the branch, and only creates one if herdr reports
+`worktree_not_found`:
+
+```sh
+herdr worktree open --cwd <repo> --branch <branch> [--label <label>] --focus|--no-focus
+herdr worktree create --cwd <repo> --branch <branch> [--base <ref>] [--path <path>] [--label <label>] --focus|--no-focus
+```
+
+herdr opens the checkout as a new workspace grouped with the repo's workspace,
+and an agent runs in its root pane. If that worktree's workspace is already
+open, the agent gets a new tab labelled with the issue key there instead — the
+plugin never types into a pane that may already be running an agent.
+`focus` picks `--focus`/`--no-focus`. `trust_repository = true` adds
+`--trust-repository` to both commands — only enable it for repositories you
+have verified.
+
+To clean up a worktree and its workspace:
+
+```sh
+herdr worktree remove --workspace <id>   # add --force for uncommitted changes
+```
+
+### Worktree placeholders
+
+`branch`: `{key}` `{slug}` `{type}`. `path` and `label` additionally accept
+`{branch}`. The name is sanitized into a valid git ref; a summary with no ASCII
+letters or digits yields an empty `{slug}`, so `{key}-{slug}` falls back to
+just the key.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Original work © Vitalii Rudnykh.

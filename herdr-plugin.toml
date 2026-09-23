@@ -1,4 +1,5 @@
-# herdr-plugin.toml — manifest for the herdr-jira plugin.
+# herdr-plugin.toml — manifest for the han.jira-worktree plugin (fork of
+# a2u/herdr-jira with an optional git worktree checkout for new agents).
 #
 # A keyboard-driven Jira TUI that lives in a herdr split pane (or its own tab):
 # browse configurable JQL filters (my issues, per-project, ...), search, change
@@ -7,14 +8,14 @@
 # description, URL, ...).
 #
 # Configuration lives OUTSIDE the plugin checkout, in the herdr-managed config
-# dir (see `herdr plugin config-dir herdr-jira`):
-#   ~/.config/herdr/plugins/config/herdr-jira/config.toml
+# dir (see `herdr plugin config-dir han.jira-worktree`):
+#   ~/.config/herdr/plugins/config/han.jira-worktree/config.toml
 # Copy config.example.toml there and fill in your Jira credentials.
 
-id = "herdr-jira"
-name = "herdr-jira"
-version = "0.3.2"
-description = "Jira TUI in a herdr pane: JQL filters, search, status transitions, and one-key delegation of issues to running or newly started agents."
+id = "han.jira-worktree"
+name = "Jira Worktree"
+version = "0.1.0"
+description = "Jira TUI in a herdr pane: JQL filters, search, status transitions, and one-key delegation of issues to running or newly started agents, optionally in a fresh git worktree."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 
