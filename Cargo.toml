@@ -1,6 +1,6 @@
 [package]
 name = "herdr-jira"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Jira TUI plugin for herdr (fork of a2u/herdr-jira): filters, search, issue comments, status transitions, delegate issues to agents, open issues in new or existing git worktrees per herdr project"
