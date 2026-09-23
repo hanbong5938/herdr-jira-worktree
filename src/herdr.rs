@@ -73,6 +73,45 @@ pub struct HerdrWorkspace {
     pub tab_count: u64,
     pub pane_count: u64,
     pub agent_status: String,
+    /// Git checkout of the workspace; None for non-git workspaces.
+    pub repo: Option<WorkspaceRepo>,
+}
+
+/// The `worktree` object of a `workspace list` entry.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRepo {
+    /// Shared by the source checkout and all its linked worktrees (`…/.git`).
+    pub repo_key: String,
+    pub repo_name: String,
+    /// Source checkout root, also for linked worktrees.
+    pub repo_root: String,
+    #[allow(dead_code)]
+    pub checkout_path: String,
+    pub is_linked_worktree: bool,
+}
+
+/// A source repository ("project") herdr has open in at least one workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoProject {
+    pub name: String,
+    /// Source checkout root; the `--cwd` for `herdr worktree` commands.
+    pub root: String,
+    pub repo_key: String,
+    /// Workspaces open on linked worktrees of this repo.
+    pub open_worktrees: usize,
+    /// The workspace hosting this Jira pane belongs to this repo.
+    pub current: bool,
+}
+
+/// One checkout from `herdr worktree list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoWorktree {
+    pub branch: String,
+    pub path: String,
+    /// A herdr workspace is open on it.
+    pub open: bool,
+    /// The source checkout, not a linked worktree.
+    pub is_main: bool,
 }
 
 fn herdr_bin() -> String {
@@ -197,23 +236,166 @@ fn parse_agent(a: &Value, own_pane: &str) -> Option<HerdrAgent> {
 /// List herdr workspaces ("spaces" in the UI).
 pub fn list_workspaces() -> Result<Vec<HerdrWorkspace>, String> {
     let v = run(&["workspace", "list"])?;
-    let list = v["result"]["workspaces"]
+    Ok(v["result"]["workspaces"]
         .as_array()
-        .cloned()
+        .map(|list| list.iter().filter_map(parse_workspace).collect())
+        .unwrap_or_default())
+}
+
+/// One `workspace list` entry; None without a workspace id.
+fn parse_workspace(w: &Value) -> Option<HerdrWorkspace> {
+    let id = w["workspace_id"].as_str().filter(|s| !s.is_empty())?;
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let wt = &w["worktree"];
+    let repo = wt.is_object().then(|| WorkspaceRepo {
+        repo_key: text(&wt["repo_key"]),
+        repo_name: text(&wt["repo_name"]),
+        repo_root: text(&wt["repo_root"]),
+        checkout_path: text(&wt["checkout_path"]),
+        is_linked_worktree: wt["is_linked_worktree"].as_bool().unwrap_or(false),
+    });
+    Some(HerdrWorkspace {
+        id: id.to_string(),
+        label: w["label"].as_str().unwrap_or("(unnamed)").to_string(),
+        number: w["number"].as_u64().unwrap_or(0),
+        focused: w["focused"].as_bool().unwrap_or(false),
+        tab_count: w["tab_count"].as_u64().unwrap_or(0),
+        pane_count: w["pane_count"].as_u64().unwrap_or(0),
+        agent_status: text(&w["agent_status"]),
+        repo,
+    })
+}
+
+/// Source repositories herdr has open, current one first (see
+/// `projects_from_workspaces`). "Current" is the workspace hosting this pane
+/// (`HERDR_WORKSPACE_ID`), or the focused one outside herdr.
+pub fn list_projects() -> Result<Vec<RepoProject>, String> {
+    let mut ws = list_workspaces()?;
+    // `workspace list` reports `"worktree": null` for some git workspaces;
+    // `worktree list --workspace` still knows their repo. Non-git workspaces
+    // fail the probe and stay without a repo.
+    for w in ws.iter_mut().filter(|w| w.repo.is_none()) {
+        if let Ok(v) = run(&["worktree", "list", "--workspace", w.id.as_str()]) {
+            w.repo = repo_from_worktree_list(&v["result"], &w.id);
+        }
+    }
+    let current = std::env::var("HERDR_WORKSPACE_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+        .or_else(|| ws.iter().find(|w| w.focused).map(|w| w.id.clone()))
         .unwrap_or_default();
-    Ok(list
-        .iter()
-        .map(|w| HerdrWorkspace {
-            id: w["workspace_id"].as_str().unwrap_or("").to_string(),
-            label: w["label"].as_str().unwrap_or("(unnamed)").to_string(),
-            number: w["number"].as_u64().unwrap_or(0),
-            focused: w["focused"].as_bool().unwrap_or(false),
-            tab_count: w["tab_count"].as_u64().unwrap_or(0),
-            pane_count: w["pane_count"].as_u64().unwrap_or(0),
-            agent_status: w["agent_status"].as_str().unwrap_or("").to_string(),
+    Ok(projects_from_workspaces(&ws, &current))
+}
+
+/// The repo of `workspace_id` from its `worktree list --workspace` result:
+/// `source` names the repo; the `worktrees[]` entry open in that workspace
+/// gives its checkout and whether it is a linked worktree (default: the source).
+fn repo_from_worktree_list(result: &Value, workspace_id: &str) -> Option<WorkspaceRepo> {
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let source = &result["source"];
+    let repo_key = text(&source["repo_key"]);
+    let repo_root = text(&source["repo_root"]);
+    if repo_key.is_empty() || repo_root.is_empty() {
+        return None;
+    }
+    let own = result["worktrees"].as_array().and_then(|list| {
+        list.iter()
+            .find(|w| w["open_workspace_id"].as_str() == Some(workspace_id))
+    });
+    Some(WorkspaceRepo {
+        repo_key,
+        repo_name: text(&source["repo_name"]),
+        checkout_path: own
+            .and_then(|w| w["path"].as_str())
+            .map_or_else(|| text(&source["source_checkout_path"]), str::to_string),
+        is_linked_worktree: own
+            .and_then(|w| w["is_linked_worktree"].as_bool())
+            .unwrap_or(false),
+        repo_root,
+    })
+}
+
+/// One project per repo (`repo_key`): linked-worktree workspaces fold into
+/// their source repo. The repo of `current_ws_id` comes first (even when that
+/// workspace is a linked worktree); the rest follow their lowest workspace number.
+pub fn projects_from_workspaces(ws: &[HerdrWorkspace], current_ws_id: &str) -> Vec<RepoProject> {
+    // (lowest workspace number, project)
+    let mut out: Vec<(u64, RepoProject)> = Vec::new();
+    for w in ws {
+        let Some(r) = &w.repo else { continue };
+        if r.repo_key.is_empty() || r.repo_root.is_empty() {
+            continue;
+        }
+        let idx = match out.iter().position(|(_, p)| p.repo_key == r.repo_key) {
+            Some(idx) => idx,
+            None => {
+                let name = if r.repo_name.is_empty() {
+                    std::path::Path::new(&r.repo_root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| r.repo_root.clone())
+                } else {
+                    r.repo_name.clone()
+                };
+                out.push((
+                    w.number,
+                    RepoProject {
+                        name,
+                        root: r.repo_root.clone(),
+                        repo_key: r.repo_key.clone(),
+                        open_worktrees: 0,
+                        current: false,
+                    },
+                ));
+                out.len() - 1
+            }
+        };
+        let (first, project) = &mut out[idx];
+        *first = (*first).min(w.number);
+        if r.is_linked_worktree {
+            project.open_worktrees += 1;
+        }
+        if !current_ws_id.is_empty() && w.id == current_ws_id {
+            project.current = true;
+        }
+    }
+    out.sort_by_key(|(first, p)| (!p.current, *first));
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Checkouts of the repo at `repo_root`: the source checkout and its linked worktrees.
+pub fn list_worktrees(repo_root: &str) -> Result<Vec<RepoWorktree>, String> {
+    let v = run(&["worktree", "list", "--cwd", repo_root])?;
+    Ok(parse_worktrees(&v["result"]))
+}
+
+/// `worktree list` result → openable checkouts; bare, prunable and
+/// branchless (detached) entries are skipped: `worktree open` needs a branch.
+fn parse_worktrees(result: &Value) -> Vec<RepoWorktree> {
+    let Some(list) = result["worktrees"].as_array() else {
+        return vec![];
+    };
+    list.iter()
+        .filter_map(|w| {
+            let flag = |k: &str| w[k].as_bool().unwrap_or(false);
+            if flag("is_bare") || flag("is_prunable") {
+                return None;
+            }
+            let branch = w["branch"].as_str().unwrap_or("");
+            let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            if branch.is_empty() {
+                return None;
+            }
+            Some(RepoWorktree {
+                branch: branch.to_string(),
+                path: w["path"].as_str().unwrap_or("").to_string(),
+                open: w["open_workspace_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                is_main: !flag("is_linked_worktree"),
+            })
         })
-        .filter(|w| !w.id.is_empty())
-        .collect())
+        .collect()
 }
 
 /// Result of creating a tab: the tab id plus its single root shell pane.

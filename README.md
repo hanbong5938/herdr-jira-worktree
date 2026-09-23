@@ -29,6 +29,10 @@ template (issue key, summary, description, link, …).
   `"Epic Link"` fallback for Server/DC), `←` collapses it.
 - **Issue details** — `Enter` opens a scrollable view with the description
   (Cloud ADF documents are flattened to plain text).
+- **Comments** — the issue details view (`Enter`) shows the issue's comments
+  (newest first) in a pane under the description; `Tab` switches scrolling
+  between the description and the comments. Comments are cached per issue;
+  press `r` in the issue list, then reopen the issue to fetch them again.
 - **Status transitions** — `s` lists the transitions available for the issue
   and applies the one you pick.
 - **Delegate to an agent** — `d` lists agents currently running in herdr
@@ -37,9 +41,11 @@ template (issue key, summary, description, link, …).
   (configurable). Or choose **+ start new agent…** (`n`) to pick an agent type
   and working directory — herdr runs it via `pane run` and the same Jira
   prompt is sent as soon as the agent is ready.
-- **Worktree** — `w` creates a git worktree for the selected issue: edit the
-  name (prefilled with the issue key), then optionally start an agent in it
-  that receives the Jira prompt.
+- **Worktree** — `w` creates or reopens a git worktree for the selected issue,
+  per project like herdr's own worktree creation: pick one of herdr's projects
+  (current first), then **+ new worktree** (name prefilled with the issue key)
+  or one of its existing worktrees, then optionally start an agent in it that
+  receives the Jira prompt.
 
 Works with Jira Cloud (email + API token) and Jira Server / Data Center
 (personal access token). Cloud's newer `/rest/api/2/search/jql` endpoint is
@@ -155,13 +161,14 @@ command = "han.jira-worktree.open-jira-tab"
 | --- | --- |
 | `j`/`k`, `↑`/`↓` | move / scroll |
 | `Enter` | open issue details |
+| `Tab` | issue details: switch scrolling between description and comments |
 | `→`/`l`, `←`/`h` | expand / collapse an epic (shows its child issues inline) |
 | `f`, `1`–`9` | switch filter |
 | `/` | search |
 | `J` | run a custom JQL query (prefilled with the current one) |
 | `s` | change issue status |
 | `d` | delegate issue to a running agent, or start a new one |
-| `w` | create a git worktree for the issue (name, then optional agent) |
+| `w` | git worktree for the issue (project → new/existing worktree → optional agent) |
 | `n` | in the delegate picker: start a new agent |
 | `1`–`9` | quick pick inside any popup (agents, transitions, filters) |
 | `o` | open issue in the browser |
@@ -217,15 +224,23 @@ this check; it is not recommended for cold agent starts.
 
 ## Worktrees (`w`)
 
-`w` (from the issue list or the issue details) creates a git worktree for the
-issue in three steps; `Esc` goes back one step:
+`w` (from the issue list or the issue details) creates — or reopens — a git
+worktree for the issue, per project like herdr's own worktree creation; `Esc`
+goes back one step:
 
-1. **Repo** — `[worktree.repos]` by project key (`PROJ` for `PROJ-1666`), else
-   `[worktree].repo`, else you are asked: the same directory list as for a new
-   agent, or **type path…**.
-2. **Name** — prefilled from the `branch` template (default `{key}`); edit it
-   freely (`Ctrl-U` clears). On `Enter` it is sanitized into a valid git branch
-   name.
+1. **Project** — `[worktree.repos]` by project key (`PROJ` for `PROJ-1666`),
+   else `[worktree].repo`, else you pick one of the git projects herdr has open
+   (`herdr workspace list`): one row per source repository, the current
+   workspace's project first (★, also when this pane runs in one of its linked
+   worktrees), then the rest in workspace order, each with its source checkout
+   path and number of open worktree workspaces. The last row, **type path…**
+   (`/`), takes any repo directory.
+2. **Worktree** — the project's checkouts (`herdr worktree list`), `[open]` when
+   a herdr workspace already shows them. **+ new worktree** asks for the name,
+   prefilled from the `branch` template (default `{key}`); edit it freely
+   (`Ctrl-U` clears) — on `Enter` it is sanitized into a valid git branch name.
+   Picking an existing worktree reopens it; the issue's worktree is
+   preselected when it already exists.
 3. **Agent** — **no agent** just opens the worktree workspace; or pick an agent
    from `[[delegate.agents]]` to start it there and send the Jira prompt,
    exactly like `d` (same `[delegate]` prompt/submit/readiness settings).
@@ -234,7 +249,7 @@ Add a `[worktree]` table at the end of `config.toml` (after `[[delegate.agents]]
 
 ```toml
 [worktree]
-repo = "~/workspace/platform"          # default repo; empty/unset = ask
+repo = "~/workspace/platform"          # default repo; empty/unset = pick a herdr project
 branch = "{key}"                       # name prefill, e.g. "{type}/{key}-{slug}"
 base = "origin/main"                   # base ref for new branches (default: HEAD)
 focus = true                           # focus the worktree workspace

@@ -780,3 +780,179 @@ fn trusted_repository_flag_is_passed_to_open_and_create() {
     assert!(!opened.already_open);
     mock.assert_complete();
 }
+
+/// `workspace list` entry; `repo` = (repo_name, checkout_path, is_linked_worktree).
+fn workspace_json(id: &str, number: u64, repo: Option<(&str, &str, bool)>) -> Value {
+    let mut w = json!({"workspace_id": id, "label": id, "number": number, "focused": false});
+    if let Some((name, checkout, linked)) = repo {
+        w["worktree"] = json!({
+            "checkout_path": checkout, "is_linked_worktree": linked,
+            "repo_key": format!("/x/{name}/.git"), "repo_name": name,
+            "repo_root": format!("/x/{name}"),
+        });
+    }
+    w
+}
+
+fn workspace(id: &str, number: u64, repo: Option<(&str, &str, bool)>) -> HerdrWorkspace {
+    parse_workspace(&workspace_json(id, number, repo)).unwrap()
+}
+
+#[test]
+fn workspace_repo_is_parsed_only_for_git_workspaces() {
+    let ws = workspace("w2", 2, Some(("backend", "/x/backend-feat", true)));
+    let repo = ws.repo.unwrap();
+    assert_eq!(repo.repo_key, "/x/backend/.git");
+    assert_eq!(repo.repo_root, "/x/backend");
+    assert_eq!(repo.checkout_path, "/x/backend-feat");
+    assert!(repo.is_linked_worktree);
+    assert!(workspace("w3", 3, None).repo.is_none());
+    assert!(parse_workspace(&json!({"label": "no id"})).is_none());
+}
+
+#[test]
+fn projects_fold_worktrees_into_their_repo_with_current_first() {
+    let ws = vec![
+        workspace("w1", 1, Some(("frontend", "/x/frontend", false))),
+        workspace("w2", 2, None),
+        workspace("w3", 3, Some(("backend", "/x/backend", false))),
+        workspace("w4", 4, Some(("jira", "/x/jira-feat", true))),
+        workspace("w5", 5, Some(("backend", "/x/backend-a", true))),
+        workspace("w6", 6, Some(("backend", "/x/backend-b", true))),
+    ];
+    let summary = |current: &str| -> Vec<(String, usize, bool)> {
+        projects_from_workspaces(&ws, current)
+            .into_iter()
+            .map(|p| (p.name, p.open_worktrees, p.current))
+            .collect()
+    };
+    let row = |name: &str, open: usize, current: bool| (name.to_string(), open, current);
+    // The current workspace is a linked worktree: its source repo still leads.
+    assert_eq!(
+        summary("w6"),
+        vec![
+            row("backend", 2, true),
+            row("frontend", 0, false),
+            row("jira", 1, false)
+        ]
+    );
+    // A repo open only as a linked worktree is still a project; the rest keep workspace order.
+    let projects = projects_from_workspaces(&ws, "w4");
+    assert_eq!(projects[0].root, "/x/jira");
+    assert_eq!(
+        summary("w4"),
+        vec![
+            row("jira", 1, true),
+            row("frontend", 0, false),
+            row("backend", 2, false)
+        ]
+    );
+    // Non-git or unknown current workspace: plain workspace order.
+    assert_eq!(summary("w2"), summary(""));
+    assert_eq!(summary("")[0], row("frontend", 0, false));
+}
+
+#[test]
+fn worktree_list_is_parsed_and_unopenable_entries_are_skipped() {
+    let mock = MockCli::new(vec![Step::ok(
+        &["worktree", "list", "--cwd", "/x/jira"],
+        json!({"result": {"type": "worktree_list",
+        "source": {"repo_key": "/x/jira/.git", "repo_name": "jira", "repo_root": "/x/jira"},
+        "worktrees": [
+            {"branch": "main", "is_bare": false, "is_detached": false,
+             "is_linked_worktree": false, "is_prunable": false,
+             "path": "/x/jira", "open_workspace_id": "w22"},
+            {"branch": "refs/heads/feat/x", "is_linked_worktree": true,
+             "path": "/x/jira-feat", "open_workspace_id": null},
+            {"branch": "old", "is_linked_worktree": true, "is_prunable": true, "path": "/gone"},
+            {"is_detached": true, "is_linked_worktree": true, "path": "/x/detached"},
+            {"branch": "", "is_bare": true, "path": "/x/bare"},
+            {"branch": "fix", "is_linked_worktree": true, "path": "/x/jira-fix"}
+        ]}}),
+    )]);
+    let wts = list_worktrees("/x/jira").unwrap();
+    mock.assert_complete();
+    let wt = |branch: &str, path: &str, open: bool, is_main: bool| RepoWorktree {
+        branch: branch.into(),
+        path: path.into(),
+        open,
+        is_main,
+    };
+    assert_eq!(
+        wts,
+        vec![
+            wt("main", "/x/jira", true, true),
+            wt("feat/x", "/x/jira-feat", false, false),
+            wt("fix", "/x/jira-fix", false, false),
+        ]
+    );
+}
+
+/// `worktree list --workspace` result for the jira repo; `feat` is open in w30.
+fn jira_worktree_list() -> Value {
+    json!({"result": {"type": "worktree_list",
+    "source": {"repo_key": "/x/jira/.git", "repo_name": "jira", "repo_root": "/x/jira",
+               "source_checkout_path": "/x/jira", "source_workspace_id": "w22"},
+    "worktrees": [
+        {"branch": "main", "is_linked_worktree": false, "path": "/x/jira",
+         "open_workspace_id": "w22"},
+        {"branch": "feat", "is_linked_worktree": true, "path": "/x/jira-feat",
+         "open_workspace_id": "w30"}
+    ]}})
+}
+
+#[test]
+fn probed_worktree_list_fills_the_workspace_repo() {
+    let list = jira_worktree_list();
+    let result = &list["result"];
+    let linked = repo_from_worktree_list(result, "w30").unwrap();
+    assert_eq!(linked.repo_key, "/x/jira/.git");
+    assert_eq!(linked.repo_name, "jira");
+    assert_eq!(linked.repo_root, "/x/jira");
+    assert_eq!(linked.checkout_path, "/x/jira-feat");
+    assert!(linked.is_linked_worktree);
+    // No worktree entry open in this workspace: it is the source checkout.
+    let source = repo_from_worktree_list(result, "w99").unwrap();
+    assert_eq!(source.checkout_path, "/x/jira");
+    assert!(!source.is_linked_worktree);
+    assert!(repo_from_worktree_list(&json!({"worktrees": []}), "w22").is_none());
+}
+
+#[test]
+fn projects_include_git_workspaces_without_worktree_info() {
+    let mut backend = workspace_json("w1", 1, Some(("backend", "/x/backend", false)));
+    backend["focused"] = json!(true);
+    let mut jira = workspace_json("w22", 22, None);
+    jira["worktree"] = Value::Null;
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [backend, jira, workspace_json("w3", 3, None)]}}),
+        ),
+        Step::ok(
+            &["worktree", "list", "--workspace", "w22"],
+            jira_worktree_list(),
+        ),
+        Step::error(
+            &["worktree", "list", "--workspace", "w3"],
+            "not_a_git_repository",
+        ),
+    ]);
+    let old_ws = std::env::var_os("HERDR_WORKSPACE_ID");
+    std::env::set_var("HERDR_WORKSPACE_ID", "w22");
+    let projects = list_projects();
+    match old_ws {
+        Some(value) => std::env::set_var("HERDR_WORKSPACE_ID", value),
+        None => std::env::remove_var("HERDR_WORKSPACE_ID"),
+    }
+    mock.assert_complete();
+    let names: Vec<(String, bool)> = projects
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.name, p.current))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("jira".to_string(), true), ("backend".to_string(), false)]
+    );
+}

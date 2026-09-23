@@ -3,7 +3,7 @@
 
 use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
-use crate::jira::{Issue, JiraClient, Transition};
+use crate::jira::{Comment, Issue, JiraClient, Transition};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -26,13 +26,15 @@ pub enum View {
     NewAgentCwdPicker,
     /// Free-text cwd entry (from "type path…" in the cwd picker).
     NewAgentCwdInput,
-    /// `w`: pick the repo to create the worktree in (no `[worktree]` repo configured).
-    WorktreeRepoPicker,
-    /// `w`: free-text repo path (from "type path…" in the repo picker).
+    /// `w`: pick the herdr project (source repo) for the worktree (no `[worktree]` repo configured).
+    WorktreeProjectPicker,
+    /// `w`: free-text repo path (from "type path…" in the project picker).
     WorktreeRepoInput,
-    /// `w`: worktree (branch) name, prefilled from `[worktree].branch`.
+    /// `w`: the repo's worktrees; row 0 = "+ new worktree".
+    WorktreeListPicker,
+    /// `w`: new worktree (branch) name, prefilled from `[worktree].branch`.
     WorktreeNameInput,
-    /// `w`: optionally start an agent in the new worktree.
+    /// `w`: optionally start an agent in the worktree.
     WorktreeAgentPicker,
     SearchInput,
     JqlInput,
@@ -65,9 +67,20 @@ pub enum Resp {
         branch: String,
         result: Result<String, String>,
     },
+    /// `w`: herdr projects for the project picker.
+    Projects(Result<Vec<herdr::RepoProject>, String>),
+    /// `w`: checkouts of the repo at `repo`.
+    RepoWorktrees {
+        repo: String,
+        result: Result<Vec<herdr::RepoWorktree>, String>,
+    },
     Children {
         epic: String,
         result: Result<Vec<Issue>, String>,
+    },
+    Comments {
+        key: String,
+        result: Result<Vec<Comment>, String>,
     },
 }
 
@@ -116,17 +129,37 @@ pub struct App {
 
     /// `w` flow: validated repo dir the worktree is created from.
     pub wt_repo: String,
-    /// The repo came from the picker (Esc on the name input returns there).
-    pub wt_repo_asked: bool,
+    /// Display name of `wt_repo` (project name or directory name).
+    pub wt_repo_name: String,
+    /// The project picker was shown (Esc on the worktree list returns there).
+    pub wt_project_asked: bool,
+    /// herdr projects for the project picker, current one first.
+    pub wt_projects: Vec<herdr::RepoProject>,
+    pub wt_projects_loading: bool,
+    /// Checkouts of `wt_repo` for the worktree list.
+    pub wt_worktrees: Vec<herdr::RepoWorktree>,
+    pub wt_worktrees_loading: bool,
+    /// Branch rendered from `[worktree].branch` for the selected issue.
+    pub wt_default_branch: String,
+    /// The agent picker was reached from an existing worktree (not the name input).
+    pub wt_existing: bool,
     /// Worktree name being edited.
     pub wt_name_input: String,
-    /// Sanitized branch name confirmed on the name input.
+    /// Branch the agent picker opens: sanitized new name or an existing worktree's branch.
     pub wt_branch: String,
 
     pub search_input: String,
     pub jql_input: String,
     pub last_jql: String,
     pub detail_scroll: u16,
+
+    /// Comments per issue key (newest first), in-flight fetches and failures.
+    pub comments: HashMap<String, Vec<Comment>>,
+    pub comments_loading: HashSet<String>,
+    pub comments_err: HashMap<String, String>,
+    pub comment_scroll: u16,
+    /// Detail view: j/k scroll the comments pane instead of the description.
+    pub detail_focus_comments: bool,
 
     pub toast: Option<(String, bool, Instant)>, // message, is_error, shown_at
 }
@@ -182,13 +215,25 @@ impl App {
             cwd_choices: vec![],
             cwd_input: String::new(),
             wt_repo: String::new(),
-            wt_repo_asked: false,
+            wt_repo_name: String::new(),
+            wt_project_asked: false,
+            wt_projects: vec![],
+            wt_projects_loading: false,
+            wt_worktrees: vec![],
+            wt_worktrees_loading: false,
+            wt_default_branch: String::new(),
+            wt_existing: false,
             wt_name_input: String::new(),
             wt_branch: String::new(),
             search_input: String::new(),
             jql_input: String::new(),
             last_jql: String::new(),
             detail_scroll: 0,
+            comments: HashMap::new(),
+            comments_loading: HashSet::new(),
+            comments_err: HashMap::new(),
+            comment_scroll: 0,
+            detail_focus_comments: false,
             toast: None,
         }
     }
@@ -200,7 +245,9 @@ impl App {
                     self.cfg = cfg;
                     self.client = Some(Arc::new(client));
                     self.fatal = None;
-                    self.filter_idx = self.filter_idx.min(self.cfg.filters.len().saturating_sub(1));
+                    self.filter_idx = self
+                        .filter_idx
+                        .min(self.cfg.filters.len().saturating_sub(1));
                     self.load_filter(self.filter_idx);
                 }
                 Err(e) => {
@@ -238,7 +285,9 @@ impl App {
     // ---- background requests ----
 
     fn spawn_search(&mut self, jql: String, title: String) {
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         self.last_jql = jql.clone();
         self.loading = true;
         let tx = self.tx.clone();
@@ -249,7 +298,9 @@ impl App {
     }
 
     pub fn load_filter(&mut self, idx: usize) {
-        let Some(filter) = self.cfg.filters.get(idx).cloned() else { return };
+        let Some(filter) = self.cfg.filters.get(idx).cloned() else {
+            return;
+        };
         self.filter_idx = idx;
         let jql = self.cfg.expand_jql(&filter.jql);
         self.spawn_search(jql, filter.name);
@@ -264,8 +315,12 @@ impl App {
     }
 
     fn request_transitions(&mut self) {
-        let Some(issue) = self.selected_issue() else { return };
-        let Some(client) = self.client.clone() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         let key = issue.key.clone();
         self.transitions_for = key.clone();
         self.transitions.clear();
@@ -280,19 +335,46 @@ impl App {
     }
 
     fn apply_transition(&mut self, t: Transition) {
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         let key = self.transitions_for.clone();
         let tx = self.tx.clone();
         self.toast(format!("{key}: applying \"{}\"…", t.name), false);
         std::thread::spawn(move || {
             let result = client.apply_transition(&key, &t.id);
-            let _ = tx.send(Resp::Transitioned { key, name: t.to_status, result });
+            let _ = tx.send(Resp::Transitioned {
+                key,
+                name: t.to_status,
+                result,
+            });
+        });
+    }
+
+    /// Fetch comments for `key` unless cached, failed, or already in flight.
+    fn fetch_comments(&mut self, key: String) {
+        if self.comments.contains_key(&key)
+            || self.comments_err.contains_key(&key)
+            || self.comments_loading.contains(&key)
+        {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.comments_loading.insert(key.clone());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = client.comments(&key);
+            let _ = tx.send(Resp::Comments { key, result });
         });
     }
 
     /// Expand the selected epic (fetching its children on first open).
     fn expand_epic(&mut self) {
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         if !is_epic(issue) {
             return;
         }
@@ -304,7 +386,9 @@ impl App {
             self.expanded.insert(key);
             return;
         }
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         if !self.loading_children.insert(key.clone()) {
             return; // fetch already in flight
         }
@@ -324,7 +408,9 @@ impl App {
     /// epic and move the selection onto it.
     fn collapse_epic(&mut self) {
         let vis = self.visible();
-        let Some(&(issue, depth)) = vis.get(self.selected) else { return };
+        let Some(&(issue, depth)) = vis.get(self.selected) else {
+            return;
+        };
         let epic_key = if depth == 0 {
             if !(is_epic(issue) && self.expanded.contains(&issue.key)) {
                 return;
@@ -429,7 +515,9 @@ impl App {
     }
 
     fn delegate_to(&mut self, agent: HerdrAgent) {
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         let text = build_prompt(&self.cfg, issue);
         let key = issue.key.clone();
         let submit = self.cfg.delegate.submit;
@@ -449,7 +537,9 @@ impl App {
     /// Spawn a fresh agent in the chosen workspace + cwd, wait until ready,
     /// send the Jira prompt.
     fn start_new_and_delegate(&mut self, cwd_raw: String) {
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         let Some(spawn) = self.pending_spawn.clone() else {
             self.toast("no agent selected", true);
             return;
@@ -507,15 +597,9 @@ impl App {
             false,
         );
         std::thread::spawn(move || {
-            let result = herdr::start_and_delegate(
-                &opts,
-                &text,
-                submit,
-                delay,
-                startup,
-                wait_ready,
-            )
-            .map(|a| a.label);
+            let result =
+                herdr::start_and_delegate(&opts, &text, submit, delay, startup, wait_ready)
+                    .map(|a| a.label);
             let label = match &result {
                 Ok(l) => l.clone(),
                 Err(_) => agent_label,
@@ -528,49 +612,151 @@ impl App {
     // ---- `w`: git worktree for the selected issue ----
 
     /// Resolve the repo from `[worktree]` (per project key, then the default)
-    /// or ask for it; then ask for the worktree name.
+    /// or let the user pick a herdr project; then show the repo's worktrees.
     fn open_worktree(&mut self) {
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         let wcfg = &self.cfg.worktree;
+        let default_branch = render_branch_name(&wcfg.branch, issue);
         let configured = wcfg
             .repos
             .get(project_key(&issue.key))
             .filter(|r| !r.trim().is_empty())
             .or(Some(&wcfg.repo).filter(|r| !r.trim().is_empty()))
             .cloned();
+        self.wt_default_branch = default_branch;
+        self.wt_existing = false;
         let Some(raw) = configured else {
-            self.wt_repo_asked = true;
-            self.cwd_choices = collect_cwd_choices(&self.cfg, &self.agents);
-            self.picker_sel = 0;
-            self.view = View::WorktreeRepoPicker;
+            self.wt_project_asked = true;
+            self.open_worktree_project_picker();
             return;
         };
-        self.wt_repo_asked = false;
+        self.wt_project_asked = false;
         match resolve_cwd(&raw) {
-            Ok(repo) => self.open_worktree_name_input(repo),
+            Ok(repo) => {
+                let name = dir_name(&repo);
+                self.open_worktree_list(repo, name);
+            }
             Err(e) => self.toast(format!("worktree repo: {e}"), true),
         }
     }
 
-    /// Repo known: open the name input prefilled from `[worktree].branch`.
-    fn open_worktree_name_input(&mut self, repo: String) {
-        let Some(issue) = self.selected_issue() else { return };
-        let name = render_branch_name(&self.cfg.worktree.branch, issue);
-        self.wt_name_input = name;
-        self.wt_repo = repo;
+    /// Step A: fetch herdr's projects (source repos); `Resp::Projects` fills the picker.
+    fn open_worktree_project_picker(&mut self) {
+        self.wt_projects.clear();
+        self.wt_projects_loading = true;
+        self.picker_sel = 0;
+        self.view = View::WorktreeProjectPicker;
+        let tx = self.tx.clone();
+        spawn_herdr(move || {
+            let _ = tx.send(Resp::Projects(herdr::list_projects()));
+        });
+    }
+
+    /// Back to the project picker with the chosen project (or "type path…") selected.
+    fn return_to_project_picker(&mut self) {
+        self.picker_sel = self
+            .wt_projects
+            .iter()
+            .position(|p| herdr::expand_path(&p.root) == self.wt_repo)
+            .unwrap_or(self.wt_projects.len());
+        self.view = View::WorktreeProjectPicker;
+    }
+
+    /// Step B: fetch the worktrees of `repo`; `Resp::RepoWorktrees` fills the list.
+    fn open_worktree_list(&mut self, repo: String, name: String) {
+        self.wt_repo = repo.clone();
+        self.wt_repo_name = name;
+        self.wt_worktrees.clear();
+        self.wt_worktrees_loading = true;
+        self.picker_sel = 0;
+        self.view = View::WorktreeListPicker;
+        let tx = self.tx.clone();
+        spawn_herdr(move || {
+            let result = herdr::list_worktrees(&repo);
+            let _ = tx.send(Resp::RepoWorktrees { repo, result });
+        });
+    }
+
+    /// Back to the worktree list with `branch`'s row (or "+ new worktree") selected.
+    fn return_to_worktree_list(&mut self, branch: Option<&str>) {
+        self.picker_sel = branch
+            .and_then(|b| self.wt_worktrees.iter().position(|w| w.branch == b))
+            .map_or(0, |i| i + 1);
+        self.view = View::WorktreeListPicker;
+    }
+
+    /// "+ new worktree": the name input, prefilled from `[worktree].branch`.
+    fn open_worktree_name_input(&mut self) {
+        self.wt_name_input = self.wt_default_branch.clone();
         self.view = View::WorktreeNameInput;
     }
 
     fn open_worktree_repo_input(&mut self) {
         let pref = self
-            .cwd_choices
+            .wt_projects
             .get(self.picker_sel)
-            .or(self.cwd_choices.first())
-            .cloned()
+            .or(self.wt_projects.first())
+            .map(|p| p.root.clone())
             .or_else(|| std::env::var("HOME").ok())
             .unwrap_or_default();
         self.cwd_input = pref;
         self.view = View::WorktreeRepoInput;
+    }
+
+    /// Any step of the `w` flow is on screen.
+    fn in_worktree_flow(&self) -> bool {
+        matches!(
+            self.view,
+            View::WorktreeProjectPicker
+                | View::WorktreeRepoInput
+                | View::WorktreeListPicker
+                | View::WorktreeNameInput
+                | View::WorktreeAgentPicker
+        )
+    }
+
+    fn on_projects(&mut self, result: Result<Vec<herdr::RepoProject>, String>) {
+        // Stale: `w` was left, or this answers an older request.
+        if !self.wt_projects_loading || !self.in_worktree_flow() {
+            return;
+        }
+        self.wt_projects_loading = false;
+        match result {
+            Ok(projects) => {
+                self.wt_projects = projects;
+                if self.view == View::WorktreeProjectPicker {
+                    self.picker_sel = self.wt_projects.iter().position(|p| p.current).unwrap_or(0);
+                }
+            }
+            // "type path…" stays available.
+            Err(e) => self.toast(format!("herdr projects: {e}"), true),
+        }
+    }
+
+    fn on_repo_worktrees(
+        &mut self,
+        repo: String,
+        result: Result<Vec<herdr::RepoWorktree>, String>,
+    ) {
+        // Stale: another repo was picked, `w` was left, or already answered.
+        if !self.wt_worktrees_loading || repo != self.wt_repo || !self.in_worktree_flow() {
+            return;
+        }
+        self.wt_worktrees_loading = false;
+        match result {
+            Ok(worktrees) => {
+                self.wt_worktrees = worktrees;
+                // The issue's branch already has a worktree: preselect reopening it.
+                if self.view == View::WorktreeListPicker {
+                    let branch = self.wt_default_branch.clone();
+                    self.return_to_worktree_list(Some(branch.as_str()));
+                }
+            }
+            // "+ new worktree" stays available.
+            Err(e) => self.toast(format!("worktrees: {e}"), true),
+        }
     }
 
     /// Open (or create) the worktree without an agent; reported as `WorktreeOpened`.
@@ -579,7 +765,12 @@ impl App {
         let focus = self.cfg.worktree.focus;
         let branch = opts.branch.clone();
         let tx = self.tx.clone();
-        self.toast(format!("creating worktree {branch}…"), false);
+        let verb = if self.wt_existing {
+            "opening"
+        } else {
+            "creating"
+        };
+        self.toast(format!("{verb} worktree {branch}…"), false);
         std::thread::spawn(move || {
             let result =
                 herdr::open_or_create_worktree(&repo, &opts, focus).map(|wt| wt.checkout_path);
@@ -593,7 +784,9 @@ impl App {
             self.toast(format!("{}: empty command", spawn.name), true);
             return;
         }
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         let text = build_prompt(&self.cfg, issue);
         let key = issue.key.clone();
         let submit = self.cfg.delegate.submit;
@@ -615,15 +808,9 @@ impl App {
         let tx = self.tx.clone();
         self.toast(format!("starting {agent_label} for {key} ({hint})…"), false);
         std::thread::spawn(move || {
-            let result = herdr::start_and_delegate(
-                &opts,
-                &text,
-                submit,
-                delay,
-                startup,
-                wait_ready,
-            )
-            .map(|a| a.label);
+            let result =
+                herdr::start_and_delegate(&opts, &text, submit, delay, startup, wait_ready)
+                    .map(|a| a.label);
             let label = match &result {
                 Ok(l) => l.clone(),
                 Err(_) => agent_label,
@@ -640,7 +827,9 @@ impl App {
     }
 
     fn open_in_browser(&mut self) {
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         let url = issue.url.clone();
         #[cfg(target_os = "macos")]
         let opener = "open";
@@ -683,6 +872,8 @@ impl App {
             }
             Resp::Transitioned { key, name, result } => match result {
                 Ok(()) => {
+                    self.comments.remove(&key);
+                    self.comments_err.remove(&key);
                     self.toast(format!("{key} → {name}"), false);
                     self.load_filter(self.filter_idx);
                 }
@@ -705,7 +896,10 @@ impl App {
                         // Still allow starting a new agent if list failed.
                         if self.can_start_new_agent() {
                             self.agents.clear();
-                            self.toast(format!("list agents failed ({e}); start new is available"), true);
+                            self.toast(
+                                format!("list agents failed ({e}); start new is available"),
+                                true,
+                            );
                         } else {
                             self.view = View::List;
                             self.toast(format!("agents: {e}"), true);
@@ -753,6 +947,8 @@ impl App {
                 ),
                 Err(e) => self.toast(format!("worktree {branch}: {e}"), true),
             },
+            Resp::Projects(result) => self.on_projects(result),
+            Resp::RepoWorktrees { repo, result } => self.on_repo_worktrees(repo, result),
             Resp::Children { epic, result } => {
                 self.loading_children.remove(&epic);
                 match result {
@@ -764,6 +960,18 @@ impl App {
                         self.expanded.insert(epic);
                     }
                     Err(e) => self.toast(format!("{epic}: children: {e}"), true),
+                }
+            }
+            Resp::Comments { key, result } => {
+                self.comments_loading.remove(&key);
+                match result {
+                    Ok(list) => {
+                        self.comments_err.remove(&key);
+                        self.comments.insert(key, list);
+                    }
+                    Err(e) => {
+                        self.comments_err.insert(key, e);
+                    }
                 }
             }
         }
@@ -794,8 +1002,9 @@ impl App {
             View::NewAgentWorkspacePicker => self.keys_new_agent_workspace(key),
             View::NewAgentCwdPicker => self.keys_new_agent_cwd(key),
             View::NewAgentCwdInput => self.keys_cwd_input(key),
-            View::WorktreeRepoPicker => self.keys_worktree_repo(key),
+            View::WorktreeProjectPicker => self.keys_worktree_project(key),
             View::WorktreeRepoInput => self.keys_worktree_repo_input(key),
+            View::WorktreeListPicker => self.keys_worktree_list(key),
             View::WorktreeNameInput => self.keys_worktree_name(key),
             View::WorktreeAgentPicker => self.keys_worktree_agent(key),
             View::SearchInput => self.keys_search(key),
@@ -832,9 +1041,12 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.expand_epic(),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_epic(),
             KeyCode::Enter => {
-                if self.selected_issue().is_some() {
+                if let Some(key) = self.selected_issue().map(|i| i.key.clone()) {
                     self.detail_scroll = 0;
+                    self.detail_focus_comments = false;
                     self.view = View::Detail;
+                    self.comment_scroll = 0;
+                    self.fetch_comments(key);
                 }
             }
             KeyCode::Char('f') => {
@@ -855,7 +1067,11 @@ impl App {
                 self.jql_input = self.last_jql.clone();
                 self.view = View::JqlInput;
             }
-            KeyCode::Char('r') => self.load_filter(self.filter_idx),
+            KeyCode::Char('r') => {
+                self.comments.clear();
+                self.comments_err.clear();
+                self.load_filter(self.filter_idx);
+            }
             KeyCode::Char('R') => {
                 self.reload_config();
                 self.toast("config reloaded", false);
@@ -873,21 +1089,39 @@ impl App {
     fn keys_detail(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Tab => self.detail_focus_comments = !self.detail_focus_comments,
             KeyCode::Char('j') | KeyCode::Down => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1)
+                let s = self.focused_scroll();
+                *s = s.saturating_add(1)
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                let s = self.focused_scroll();
+                *s = s.saturating_sub(1)
             }
-            KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(15),
-            KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(15),
-            KeyCode::Char('g') => self.detail_scroll = 0,
+            KeyCode::PageDown => {
+                let s = self.focused_scroll();
+                *s = s.saturating_add(15)
+            }
+            KeyCode::PageUp => {
+                let s = self.focused_scroll();
+                *s = s.saturating_sub(15)
+            }
+            KeyCode::Char('g') => *self.focused_scroll() = 0,
             KeyCode::Char('s') => self.request_transitions(),
             KeyCode::Char('d') => self.request_agents(),
             KeyCode::Char('w') => self.open_worktree(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
             _ => {}
+        }
+    }
+
+    /// Detail view: scroll offset of the pane that has focus.
+    fn focused_scroll(&mut self) -> &mut u16 {
+        if self.detail_focus_comments {
+            &mut self.comment_scroll
+        } else {
+            &mut self.detail_scroll
         }
     }
 
@@ -1111,11 +1345,11 @@ impl App {
         }
     }
 
-    fn keys_worktree_repo(&mut self, key: KeyEvent) {
-        // Last row is always "type path…"; rows above are concrete dirs.
-        let n = self.cwd_choices.len() + 1;
+    fn keys_worktree_project(&mut self, key: KeyEvent) {
+        // Last row is always "type path…"; rows above are herdr projects.
+        let n = self.wt_projects.len() + 1;
         if let Some(idx) = Self::picker_number(&key, n) {
-            self.pick_worktree_repo_row(idx);
+            self.pick_worktree_project_row(idx);
             return;
         }
         match key.code {
@@ -1127,27 +1361,34 @@ impl App {
                 self.picker_sel = Self::move_sel(n, self.picker_sel, -1)
             }
             KeyCode::Char('/') | KeyCode::Char('e') => self.open_worktree_repo_input(),
-            KeyCode::Enter => self.pick_worktree_repo_row(self.picker_sel),
+            KeyCode::Enter => self.pick_worktree_project_row(self.picker_sel),
             _ => {}
         }
     }
 
-    fn pick_worktree_repo_row(&mut self, row: usize) {
-        let Some(dir) = self.cwd_choices.get(row).cloned() else {
+    fn pick_worktree_project_row(&mut self, row: usize) {
+        let Some(project) = self.wt_projects.get(row).cloned() else {
             self.open_worktree_repo_input();
             return;
         };
-        match resolve_cwd(&dir) {
-            Ok(repo) => self.open_worktree_name_input(repo),
+        match resolve_cwd(&project.root) {
+            Ok(repo) => self.open_worktree_list(repo, project.name),
             Err(e) => self.toast(format!("repo: {e}"), true),
         }
     }
 
     fn keys_worktree_repo_input(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.view = View::WorktreeRepoPicker,
+            KeyCode::Esc => {
+                // Back to "type path…".
+                self.picker_sel = self.wt_projects.len();
+                self.view = View::WorktreeProjectPicker;
+            }
             KeyCode::Enter => match resolve_cwd(&self.cwd_input) {
-                Ok(repo) => self.open_worktree_name_input(repo),
+                Ok(repo) => {
+                    let name = dir_name(&repo);
+                    self.open_worktree_list(repo, name);
+                }
                 Err(e) => self.toast(format!("repo: {e}"), true),
             },
             KeyCode::Backspace => {
@@ -1161,21 +1402,51 @@ impl App {
         }
     }
 
-    fn keys_worktree_name(&mut self, key: KeyEvent) {
+    /// Row 0 = "+ new worktree"; rows 1.. = the repo's existing worktrees.
+    fn keys_worktree_list(&mut self, key: KeyEvent) {
+        let n = self.wt_worktrees.len() + 1;
+        if let Some(idx) = Self::picker_number(&key, n) {
+            self.pick_worktree_list_row(idx);
+            return;
+        }
         match key.code {
-            KeyCode::Esc => {
-                if self.wt_repo_asked {
-                    // Back to the repo picker with the chosen dir (or "type path…") selected.
-                    self.picker_sel = self
-                        .cwd_choices
-                        .iter()
-                        .position(|c| c == &self.wt_repo)
-                        .unwrap_or(self.cwd_choices.len());
-                    self.view = View::WorktreeRepoPicker;
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if self.wt_project_asked {
+                    self.return_to_project_picker();
                 } else {
                     self.view = View::List;
                 }
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.picker_sel = Self::move_sel(n, self.picker_sel, 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.picker_sel = Self::move_sel(n, self.picker_sel, -1)
+            }
+            KeyCode::Enter => self.pick_worktree_list_row(self.picker_sel),
+            _ => {}
+        }
+    }
+
+    fn pick_worktree_list_row(&mut self, row: usize) {
+        let Some(idx) = row.checked_sub(1) else {
+            self.wt_existing = false;
+            self.open_worktree_name_input();
+            return;
+        };
+        let Some(wt) = self.wt_worktrees.get(idx) else {
+            return;
+        };
+        // `open_or_create_worktree` reopens an existing branch's worktree.
+        self.wt_branch = wt.branch.clone();
+        self.wt_existing = true;
+        self.picker_sel = 0;
+        self.view = View::WorktreeAgentPicker;
+    }
+
+    fn keys_worktree_name(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.return_to_worktree_list(None),
             KeyCode::Enter => {
                 let branch = sanitize_branch_name(&self.wt_name_input);
                 if branch.is_empty() {
@@ -1205,7 +1476,14 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::WorktreeNameInput,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if self.wt_existing {
+                    let branch = self.wt_branch.clone();
+                    self.return_to_worktree_list(Some(branch.as_str()));
+                } else {
+                    self.view = View::WorktreeNameInput;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.picker_sel = Self::move_sel(n, self.picker_sel, 1)
             }
@@ -1225,7 +1503,9 @@ impl App {
                 None => return,
             },
         };
-        let Some(issue) = self.selected_issue() else { return };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
         let opts = worktree_opts(&self.cfg, issue, &self.wt_branch);
         self.view = View::List;
         match spawn {
@@ -1297,10 +1577,8 @@ mod tests {
     }
 
     fn test_cfg(prompt: &str, max_desc: usize) -> Config {
-        let mut cfg: Config = toml::from_str(
-            "[jira]\nbase_url = \"https://x.atlassian.net\"\n",
-        )
-        .unwrap();
+        let mut cfg: Config =
+            toml::from_str("[jira]\nbase_url = \"https://x.atlassian.net\"\n").unwrap();
         cfg.delegate.prompt = prompt.into();
         cfg.delegate.max_description_chars = max_desc;
         cfg
@@ -1308,7 +1586,10 @@ mod tests {
 
     #[test]
     fn prompt_placeholders_are_filled() {
-        let cfg = test_cfg("{key}: {summary} [{status}/{priority}] {labels}\n{description}\n{url}", 0);
+        let cfg = test_cfg(
+            "{key}: {summary} [{status}/{priority}] {labels}\n{description}\n{url}",
+            0,
+        );
         let p = build_prompt(&cfg, &test_issue());
         assert_eq!(
             p,
@@ -1405,23 +1686,114 @@ mod tests {
         assert_eq!(project_key("A-B-12"), "A-B");
     }
 
-    #[test]
-    fn worktree_with_configured_repo_opens_prefilled_name_input() {
-        let mut app = list_app();
-        app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(app.view, View::WorktreeNameInput);
-        assert_eq!(app.wt_name_input, "PROJ-7");
-        assert_eq!(app.wt_repo, resolve_cwd(&temp_dir()).unwrap());
-        assert!(!app.wt_repo_asked);
+    fn project(name: &str, current: bool) -> herdr::RepoProject {
+        herdr::RepoProject {
+            name: name.into(),
+            root: temp_dir(),
+            repo_key: format!("/x/{name}/.git"),
+            open_worktrees: 0,
+            current,
+        }
+    }
+
+    fn worktree(branch: &str) -> herdr::RepoWorktree {
+        herdr::RepoWorktree {
+            branch: branch.into(),
+            path: format!("/x/{branch}"),
+            open: false,
+            is_main: false,
+        }
     }
 
     #[test]
-    fn worktree_without_repo_asks_for_it() {
+    fn worktree_with_configured_repo_lists_its_worktrees() {
+        let mut app = list_app();
+        app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert_eq!(app.wt_repo, resolve_cwd(&temp_dir()).unwrap());
+        assert!(!app.wt_project_asked);
+        // Row 0 = "+ new worktree", prefilled from `[worktree].branch`.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeNameInput);
+        assert_eq!(app.wt_name_input, "PROJ-7");
+    }
+
+    #[test]
+    fn worktree_without_repo_asks_for_a_herdr_project() {
         let mut app = list_app();
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(app.view, View::WorktreeRepoPicker);
-        assert!(app.wt_repo_asked);
+        assert_eq!(app.view, View::WorktreeProjectPicker);
+        assert!(app.wt_project_asked);
+        app.on_resp(Resp::Projects(Ok(vec![
+            project("jira", true),
+            project("web", false),
+        ])));
+        assert_eq!(app.wt_projects.len(), 2);
+        assert_eq!(app.picker_sel, 0);
+
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert_eq!(app.wt_repo_name, "web");
+        assert_eq!(app.wt_repo, resolve_cwd(&temp_dir()).unwrap());
+    }
+
+    #[test]
+    fn existing_worktree_of_the_issue_branch_is_preselected_and_reopened() {
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('w'));
+        app.on_resp(Resp::Projects(Ok(vec![project("jira", true)])));
+        press(&mut app, KeyCode::Enter);
+        let repo = app.wt_repo.clone();
+        app.on_resp(Resp::RepoWorktrees {
+            repo,
+            result: Ok(vec![worktree("main"), worktree("PROJ-7")]),
+        });
+        assert_eq!(app.picker_sel, 2);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        assert_eq!(app.wt_branch, "PROJ-7");
+
+        // Esc: agent picker -> worktree list (same row) -> project picker -> List.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert_eq!(app.picker_sel, 2);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeProjectPicker);
+        assert_eq!(app.picker_sel, 0);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::List);
+    }
+
+    #[test]
+    fn stale_or_failed_herdr_answers_keep_the_flow_usable() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        // Another repo's answer is ignored.
+        app.on_resp(Resp::RepoWorktrees {
+            repo: "/elsewhere".into(),
+            result: Ok(vec![worktree("x")]),
+        });
+        assert!(app.wt_worktrees.is_empty());
+        assert!(app.wt_worktrees_loading);
+        // A failed listing still offers "+ new worktree".
+        let repo = app.wt_repo.clone();
+        app.on_resp(Resp::RepoWorktrees {
+            repo,
+            result: Err("boom".into()),
+        });
+        assert!(matches!(&app.toast, Some((_, true, _))));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeNameInput);
+
+        // Projects arriving after `w` was left are dropped.
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Esc);
+        app.on_resp(Resp::Projects(Ok(vec![project("jira", true)])));
+        assert!(app.wt_projects.is_empty());
+        assert_eq!(app.view, View::List);
     }
 
     #[test]
@@ -1429,6 +1801,7 @@ mod tests {
         let mut app = list_app();
         app.cfg.worktree.repo = temp_dir();
         press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Enter);
         app.wt_name_input = "@".into();
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::WorktreeNameInput);
@@ -1442,10 +1815,11 @@ mod tests {
 
     #[test]
     fn worktree_esc_walks_back_one_step() {
-        // Repo from config: agent picker -> name input (edit kept) -> List.
+        // Repo from config: agent picker -> name input (edit kept) -> list -> List.
         let mut app = list_app();
         app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
         press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Enter);
         app.wt_name_input = "feature/x y".into();
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::WorktreeAgentPicker);
@@ -1453,18 +1827,28 @@ mod tests {
         assert_eq!(app.view, View::WorktreeNameInput);
         assert_eq!(app.wt_name_input, "feature/x y");
         press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert_eq!(app.picker_sel, 0);
+        press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, View::List);
 
-        // Repo asked: name input -> repo picker.
+        // Typed path: name input -> list -> project picker ("type path…") -> path input.
         let mut app = list_app();
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('/'));
         assert_eq!(app.view, View::WorktreeRepoInput);
         app.cwd_input = temp_dir();
         press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::WorktreeNameInput);
         press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::WorktreeRepoPicker);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeProjectPicker);
+        assert_eq!(app.picker_sel, app.wt_projects.len());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeRepoInput);
     }
 }
 
@@ -1607,7 +1991,26 @@ fn resolve_cwd(cwd_raw: &str) -> Result<String, String> {
 /// Jira project key of an issue key: everything before the last '-'
 /// ("PROJ-1666" -> "PROJ").
 fn project_key(issue_key: &str) -> &str {
-    issue_key.rsplit_once('-').map_or(issue_key, |(project, _)| project)
+    issue_key
+        .rsplit_once('-')
+        .map_or(issue_key, |(project, _)| project)
+}
+
+/// Last path component, for display ("/x/backend" -> "backend").
+fn dir_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Run herdr CLI work off the UI thread; it reports back through `Resp`.
+/// Unit tests skip it: they must never reach a real herdr (or race the mock
+/// CLI in `herdr::tests`) and feed `App::on_resp` directly instead.
+fn spawn_herdr(work: impl FnOnce() + Send + 'static) {
+    if cfg!(test) {
+        return;
+    }
+    std::thread::spawn(work);
 }
 
 /// `herdr worktree` options for `issue` on `branch` from `[worktree]`.

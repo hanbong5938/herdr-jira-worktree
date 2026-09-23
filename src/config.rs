@@ -53,7 +53,9 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { jql: default_search_jql() }
+        Self {
+            jql: default_search_jql(),
+        }
     }
 }
 
@@ -350,7 +352,10 @@ placement = "tab"
         assert_eq!(wt.repo, "~/src/app");
         assert_eq!(wt.branch, "feature/{key}-{slug}");
         assert_eq!(wt.repos.len(), 1);
-        assert_eq!(wt.repos.get("PROJ").map(String::as_str), Some("~/w/backend"));
+        assert_eq!(
+            wt.repos.get("PROJ").map(String::as_str),
+            Some("~/w/backend")
+        );
         assert!(wt.focus);
         assert!(!wt.trust_repository);
         assert_eq!(wt.label, "{key}");

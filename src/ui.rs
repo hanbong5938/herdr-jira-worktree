@@ -2,6 +2,7 @@
 //! issue list.
 
 use crate::app::{is_epic, App, View};
+use crate::jira::Comment;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -35,8 +36,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::NewAgentWorkspacePicker => draw_new_agent_workspace_picker(f, app),
         View::NewAgentCwdPicker => draw_new_agent_cwd_picker(f, app),
         View::NewAgentCwdInput => draw_cwd_input(f, app),
-        View::WorktreeRepoPicker => draw_worktree_repo_picker(f, app),
+        View::WorktreeProjectPicker => draw_worktree_project_picker(f, app),
         View::WorktreeRepoInput => draw_worktree_repo_input(f, app),
+        View::WorktreeListPicker => draw_worktree_list_picker(f, app),
         View::WorktreeNameInput => draw_worktree_name_input(f, app),
         View::WorktreeAgentPicker => draw_worktree_agent_picker(f, app),
         View::SearchInput => draw_search(f, app),
@@ -88,8 +90,15 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         .map(|&(i, depth)| {
             // Epics carry an expand indicator; their children are indented.
             let (prefix, key_style) = if is_epic(i) {
-                let arrow = if app.expanded.contains(&i.key) { "▾ " } else { "▸ " };
-                (arrow.to_string(), Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                let arrow = if app.expanded.contains(&i.key) {
+                    "▾ "
+                } else {
+                    "▸ "
+                };
+                (
+                    arrow.to_string(),
+                    Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                )
             } else if depth > 0 {
                 (" └ ".to_string(), Style::new().fg(ACCENT))
             } else {
@@ -98,7 +107,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(format!("{prefix}{}", i.key)).style(key_style),
                 Cell::from(i.issue_type.clone()).style(type_style(&i.issue_type)),
-                Cell::from(i.status.clone()).style(Style::new().fg(status_color(&i.status_category))),
+                Cell::from(i.status.clone())
+                    .style(Style::new().fg(status_color(&i.status_category))),
                 Cell::from(i.assignee.clone()).style(Style::new().fg(Color::Magenta)),
                 Cell::from(i.updated.clone()).style(Style::new().fg(Color::DarkGray)),
                 Cell::from(i.summary.clone()),
@@ -119,10 +129,20 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         ],
     )
     .header(
-        Row::new(vec!["KEY", "TYPE", "STATUS", "ASSIGNEE", "UPDATED", "SUMMARY"])
-            .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "KEY", "TYPE", "STATUS", "ASSIGNEE", "UPDATED", "SUMMARY",
+        ])
+        .style(
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
-    .row_highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+    .row_highlight_style(
+        Style::new()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
     .block(block);
 
     let mut state = TableState::default();
@@ -130,16 +150,32 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 
     if is_empty && !app.loading {
-        let empty = Paragraph::new("no issues — press r to refresh, f to pick a filter, / to search")
-            .style(Style::new().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
+        let empty =
+            Paragraph::new("no issues — press r to refresh, f to pick a filter, / to search")
+                .style(Style::new().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
         let inner = centered_rect(area, 80, 20);
         f.render_widget(empty, inner);
     }
 }
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
-    let Some(issue) = app.selected_issue() else { return };
+    let Some(issue) = app.selected_issue() else {
+        return;
+    };
+    let (issue_border, comments_border) = if app.detail_focus_comments {
+        (Color::DarkGray, ACCENT)
+    } else {
+        (ACCENT, Color::DarkGray)
+    };
+    let area = if area.height >= 12 {
+        let [top, bottom] =
+            Layout::vertical([Constraint::Min(6), Constraint::Percentage(40)]).areas(area);
+        draw_comments(f, app, &issue.key, bottom, comments_border);
+        top
+    } else {
+        area
+    };
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(issue.key.clone(), Style::new().fg(ACCENT).bold()),
@@ -147,7 +183,11 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(issue.summary.clone(), Style::new().bold()),
         ]),
         Line::default(),
-        meta_line("Status", &issue.status, status_color(&issue.status_category)),
+        meta_line(
+            "Status",
+            &issue.status,
+            status_color(&issue.status_category),
+        ),
         meta_line("Type", &issue.issue_type, Color::White),
         meta_line("Priority", &issue.priority, Color::White),
         meta_line("Assignee", &issue.assignee, Color::Magenta),
@@ -161,7 +201,9 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "Description",
-        Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
     )));
     let desc = if issue.description.trim().is_empty() {
         "(no description)".to_string()
@@ -179,10 +221,65 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(issue_border))
                 .padding(Padding::horizontal(1))
                 .title(Span::styled(" issue ", Style::new().fg(ACCENT).bold())),
         );
     f.render_widget(para, area);
+}
+
+/// Comments pane for `key`: newest first, or its loading / error / empty state.
+fn draw_comments(f: &mut Frame, app: &App, key: &str, area: Rect, border: Color) {
+    let cached = app.comments.get(key);
+    let count = cached
+        .map(|cs| format!(" ({})", cs.len()))
+        .unwrap_or_default();
+    let dim = Style::new().fg(Color::DarkGray);
+    let lines: Vec<Line> = match (cached, app.comments_err.get(key)) {
+        (Some(cs), _) if cs.is_empty() => vec![Line::styled("(no comments)", dim)],
+        (Some(cs), _) => comment_lines(cs),
+        (None, Some(e)) => vec![Line::styled(
+            format!("comments: {e}"),
+            Style::new().fg(Color::Red),
+        )],
+        (None, None) => vec![Line::styled("loading comments…", dim)],
+    };
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.comment_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(border))
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(
+                    format!(" comments · {key}{count} "),
+                    Style::new().fg(ACCENT).bold(),
+                )),
+        );
+    f.render_widget(para, area);
+}
+
+/// Per comment: `author  created` header, the body, then a blank separator.
+fn comment_lines(comments: &[Comment]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (n, c) in comments.iter().enumerate() {
+        if n > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled(c.author.clone(), Style::new().fg(Color::Magenta).bold()),
+            Span::styled(format!("  {}", c.created), Style::new().fg(Color::DarkGray)),
+        ]));
+        let body = c.body.trim_end();
+        if body.is_empty() {
+            lines.push(Line::styled("(empty)", Style::new().fg(Color::DarkGray)));
+        } else {
+            lines.extend(body.lines().map(|l| Line::from(l.to_string())));
+        }
+    }
+    lines
 }
 
 fn meta_line(label: &str, value: &str, color: Color) -> Line<'static> {
@@ -201,15 +298,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::new().fg(Color::Black).bg(Color::Green)
             };
-            f.render_widget(
-                Paragraph::new(format!(" {msg} ")).style(style),
-                area,
-            );
+            f.render_widget(Paragraph::new(format!(" {msg} ")).style(style), area);
             return;
         }
     }
     let hints = match app.view {
-        View::Detail => "Esc back  ·  j/k scroll  ·  s status  ·  d delegate  ·  w worktree  ·  o browser  ·  z zoom",
+        View::Detail => "j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  s status  ·  o browser  ·  z zoom  ·  Esc back",
         View::SearchInput => "Enter search  ·  Esc cancel",
         View::JqlInput => "Enter run JQL  ·  Ctrl-U clear  ·  Esc cancel",
         View::NewAgentCwdInput => "Enter start  ·  Ctrl-U clear  ·  Esc back",
@@ -219,22 +313,56 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         View::AgentPicker => {
             "1-9 pick  ·  n new agent  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
+        View::WorktreeProjectPicker => {
+            "1-9 pick  ·  j/k move  ·  Enter worktrees  ·  / type path  ·  Esc cancel"
+        }
+        View::WorktreeListPicker => {
+            "1-9 pick  ·  j/k move  ·  Enter new / reopen  ·  Esc back"
+        }
         View::NewAgentTypePicker
         | View::NewAgentWorkspacePicker
         | View::NewAgentCwdPicker
-        | View::WorktreeRepoPicker
         | View::WorktreeAgentPicker => {
             "1-9 pick  ·  j/k move  ·  Enter select  ·  Esc back"
         }
         View::FilterPicker | View::TransitionPicker => {
             "1-9 quick pick  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
-        _ => "Enter open  ·  →/← epic  ·  f filters  ·  / search  ·  s status  ·  d delegate  ·  w worktree  ·  z zoom  ·  r refresh  ·  ? help  ·  q quit",
+        // Priority order: narrow panes drop hints from the right; `? help` always stays.
+        _ => "Enter open  ·  w worktree  ·  d delegate  ·  s status  ·  f filters  ·  / search  ·  →/← epic  ·  r refresh  ·  z zoom  ·  q quit  ·  ? help",
     };
     f.render_widget(
-        Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(fit_hints(hints, area.width as usize))
+            .style(Style::new().fg(Color::DarkGray)),
         area,
     );
+}
+
+const HINT_SEP: &str = "  ·  ";
+
+/// Fit a `·`-separated hint line into `width` columns: drop hints from the
+/// right, but always keep the last one (the escape hatch, e.g. `? help`).
+fn fit_hints(hints: &str, width: usize) -> String {
+    if Span::raw(hints).width() <= width {
+        return hints.to_string();
+    }
+    let parts: Vec<&str> = hints.split(HINT_SEP).collect();
+    let Some((last, head)) = parts.split_last() else {
+        return String::new();
+    };
+    let sep = Span::raw(HINT_SEP).width();
+    let mut used = Span::raw(*last).width();
+    let mut kept: Vec<&str> = Vec::new();
+    for part in head {
+        let w = Span::raw(*part).width() + sep;
+        if used + w > width {
+            break;
+        }
+        used += w;
+        kept.push(part);
+    }
+    kept.push(last);
+    kept.join(HINT_SEP)
 }
 
 fn popup(f: &mut Frame, title: &str, width_pct: u16, height: u16) -> Rect {
@@ -253,7 +381,10 @@ fn popup(f: &mut Frame, title: &str, width_pct: u16, height: u16) -> Rect {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(ACCENT))
-            .title(Span::styled(format!(" {title} "), Style::new().fg(ACCENT).bold())),
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::new().fg(ACCENT).bold(),
+            )),
         rect,
     );
     Rect {
@@ -268,7 +399,11 @@ fn render_picker_list(f: &mut Frame, inner: Rect, items: Vec<ListItem>, sel: usi
     let mut state = ListState::default();
     state.select(if items.is_empty() { None } else { Some(sel) });
     let list = List::new(items)
-        .highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::new()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▸ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
@@ -284,7 +419,10 @@ fn draw_filter_picker(f: &mut Frame, app: &App) {
         .map(|(i, flt)| {
             let marker = if i == app.filter_idx { "● " } else { "  " };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{}{}. ", marker, i + 1), Style::new().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}{}. ", marker, i + 1),
+                    Style::new().fg(Color::DarkGray),
+                ),
                 Span::raw(flt.name.clone()),
             ]))
         })
@@ -311,7 +449,10 @@ fn draw_transition_picker(f: &mut Frame, app: &App) {
             ListItem::new(Line::from(vec![
                 num_span(i),
                 Span::raw(t.name.clone()),
-                Span::styled(format!("  → {}", t.to_status), Style::new().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("  → {}", t.to_status),
+                    Style::new().fg(Color::DarkGray),
+                ),
             ]))
         })
         .collect();
@@ -358,7 +499,10 @@ fn draw_agent_picker(f: &mut Frame, app: &App) {
             num_span(row),
             Span::styled(format!("{:<10}", a.label), Style::new().fg(ACCENT).bold()),
             Span::styled(format!("{:<9}", a.status), Style::new().fg(status_color)),
-            Span::styled(format!("{:<8}", a.pane_id), Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<8}", a.pane_id),
+                Style::new().fg(Color::DarkGray),
+            ),
             Span::raw(cwd),
         ])));
     }
@@ -389,10 +533,7 @@ fn draw_new_agent_type_picker(f: &mut Frame, app: &App) {
             let cmd = a.command.join(" ");
             ListItem::new(Line::from(vec![
                 num_span(i),
-                Span::styled(
-                    format!("{:<12}", a.name),
-                    Style::new().fg(ACCENT).bold(),
-                ),
+                Span::styled(format!("{:<12}", a.name), Style::new().fg(ACCENT).bold()),
                 Span::styled(cmd, Style::new().fg(Color::DarkGray)),
             ]))
         })
@@ -495,12 +636,7 @@ fn draw_new_agent_cwd_picker(f: &mut Frame, app: &App) {
         .cwd_choices
         .iter()
         .enumerate()
-        .map(|(i, p)| {
-            ListItem::new(Line::from(vec![
-                num_span(i),
-                Span::raw(short_path(p)),
-            ]))
-        })
+        .map(|(i, p)| ListItem::new(Line::from(vec![num_span(i), Span::raw(short_path(p))])))
         .collect();
     items.push(ListItem::new(Line::from(vec![
         num_span(app.cwd_choices.len()),
@@ -536,30 +672,74 @@ fn worktree_issue_key(app: &App) -> String {
         .unwrap_or_default()
 }
 
-fn draw_worktree_repo_picker(f: &mut Frame, app: &App) {
-    let title = format!("repo for worktree of {}", worktree_issue_key(app));
-    let n = app.cwd_choices.len() + 1;
-    let h = (n as u16 + 2).max(4);
-    let inner = popup(f, &title, 70, h);
-    let mut items: Vec<ListItem> = app
-        .cwd_choices
+/// Dim explanatory first line of a picker popup; returns the list area below it.
+fn picker_header(f: &mut Frame, inner: Rect, text: &str) -> Rect {
+    let [head, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    f.render_widget(
+        Paragraph::new(text).style(Style::new().fg(Color::DarkGray)),
+        head,
+    );
+    list
+}
+
+fn draw_worktree_project_picker(f: &mut Frame, app: &App) {
+    let title = format!("worktree for {} — project", worktree_issue_key(app));
+    let projects = &app.wt_projects;
+    let h = projects.len() as u16 + 4;
+    let inner = popup(f, &title, 75, h);
+    let header = if app.wt_projects_loading {
+        "listing herdr projects…"
+    } else if projects.is_empty() {
+        "no git projects open in herdr — type a repo path"
+    } else {
+        "herdr projects (source checkouts) · ★ current workspace"
+    };
+    let list = picker_header(f, inner, header);
+    let name_w = projects
+        .iter()
+        .map(|p| p.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let mut items: Vec<ListItem> = projects
         .iter()
         .enumerate()
-        .map(|(i, p)| ListItem::new(Line::from(vec![num_span(i), Span::raw(short_path(p))])))
+        .map(|(i, p)| {
+            let mut spans = vec![
+                num_span(i),
+                Span::styled(
+                    if p.current { "★ " } else { "  " },
+                    Style::new().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{:<name_w$}  ", truncate_label(&p.name, name_w)),
+                    Style::new().fg(ACCENT).bold(),
+                ),
+                Span::raw(short_path(&p.root)),
+            ];
+            if p.open_worktrees > 0 {
+                let s = if p.open_worktrees == 1 { "" } else { "s" };
+                spans.push(Span::styled(
+                    format!("  ({} open worktree{s})", p.open_worktrees),
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
         .collect();
     items.push(ListItem::new(Line::from(vec![
-        num_span(app.cwd_choices.len()),
+        num_span(projects.len()),
         Span::styled(
             "type path…",
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  (/)", Style::new().fg(Color::DarkGray)),
     ])));
-    render_picker_list(f, inner, items, app.picker_sel);
+    render_picker_list(f, list, items, app.picker_sel);
 }
 
 fn draw_worktree_repo_input(f: &mut Frame, app: &App) {
-    let title = format!("repo for worktree of {}", worktree_issue_key(app));
+    let title = format!("worktree for {} — repo path", worktree_issue_key(app));
     let inner = popup(f, &title, 75, 3);
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -570,8 +750,68 @@ fn draw_worktree_repo_input(f: &mut Frame, app: &App) {
     );
 }
 
+fn draw_worktree_list_picker(f: &mut Frame, app: &App) {
+    let title = format!(
+        "worktree for {} — {}",
+        worktree_issue_key(app),
+        app.wt_repo_name
+    );
+    let worktrees = &app.wt_worktrees;
+    let h = worktrees.len() as u16 + 4;
+    let inner = popup(f, &title, 75, h);
+    let header = if app.wt_worktrees_loading {
+        format!("listing worktrees of {}…", short_path(&app.wt_repo))
+    } else {
+        format!(
+            "create a worktree or reopen one of {}",
+            short_path(&app.wt_repo)
+        )
+    };
+    let list = picker_header(f, inner, &header);
+    let default = if app.wt_default_branch.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", app.wt_default_branch)
+    };
+    let mut items = vec![ListItem::new(Line::from(vec![
+        num_span(0),
+        Span::styled(
+            format!("+ new worktree{default}"),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ]))];
+    let branch_w = worktrees
+        .iter()
+        .map(|w| w.branch.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    items.extend(worktrees.iter().enumerate().map(|(i, w)| {
+        let mut spans = vec![
+            num_span(i + 1),
+            Span::styled(
+                format!("{:<branch_w$}  ", truncate_label(&w.branch, branch_w)),
+                Style::new().fg(ACCENT).bold(),
+            ),
+            Span::raw(short_path(&w.path)),
+        ];
+        if w.is_main {
+            spans.push(Span::styled("  (source)", Style::new().fg(Color::DarkGray)));
+        }
+        if w.open {
+            spans.push(Span::styled("  [open]", Style::new().fg(Color::Green)));
+        }
+        ListItem::new(Line::from(spans))
+    }));
+    render_picker_list(f, list, items, app.picker_sel);
+}
+
 fn draw_worktree_name_input(f: &mut Frame, app: &App) {
-    let title = format!("worktree name for {}", worktree_issue_key(app));
+    let title = format!(
+        "new worktree for {} in {}",
+        worktree_issue_key(app),
+        app.wt_repo_name
+    );
     let inner = popup(f, &title, 75, 3);
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -647,7 +887,7 @@ fn draw_jql(f: &mut Frame, app: &App) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let inner = popup(f, "help", 60, 21);
+    let inner = popup(f, "help", 60, 22);
     let rows = [
         ("j/k ↑/↓", "move / scroll"),
         ("Enter", "open issue details"),
@@ -659,9 +899,10 @@ fn draw_help(f: &mut Frame) {
         ("s", "change issue status"),
         ("d", "delegate issue to an agent"),
         ("n", "in delegate picker: start a new agent"),
-        ("w", "create git worktree for issue (name, then optional agent)"),
+        ("w", "git worktree: project → new/existing worktree → agent"),
         ("o", "open issue in browser"),
         ("z", "zoom pane (fullscreen toggle)"),
+        ("Tab", "detail: switch scroll focus issue / comments"),
         ("r", "refresh current filter"),
         ("R", "reload config.toml"),
         ("g/G", "top / bottom"),
@@ -686,7 +927,10 @@ fn draw_fatal(f: &mut Frame, err: &str) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Red))
         .padding(Padding::uniform(1))
-        .title(Span::styled(" herdr-jira-worktree: configuration ", Style::new().fg(Color::Red).bold()));
+        .title(Span::styled(
+            " herdr-jira-worktree: configuration ",
+            Style::new().fg(Color::Red).bold(),
+        ));
     let text = format!("{err}\n\nR — retry after fixing the config, q — quit");
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
@@ -702,5 +946,26 @@ fn centered_rect(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::fit_hints;
+
+    #[test]
+    fn narrow_footer_drops_middle_hints_but_keeps_the_last() {
+        let hints = "Enter open  ·  w worktree  ·  ? help";
+        assert_eq!(fit_hints(hints, 80), hints);
+        assert_eq!(fit_hints(hints, 25), "Enter open  ·  ? help");
+        assert_eq!(fit_hints(hints, 3), "? help");
+    }
+
+    #[test]
+    fn worktree_hint_survives_a_narrow_split_pane() {
+        let list = "Enter open  ·  w worktree  ·  d delegate  ·  s status  ·  f filters  ·  / search  ·  →/← epic  ·  r refresh  ·  z zoom  ·  q quit  ·  ? help";
+        let fitted = fit_hints(list, 60);
+        assert!(fitted.contains("w worktree"));
+        assert!(fitted.ends_with("? help"));
     }
 }

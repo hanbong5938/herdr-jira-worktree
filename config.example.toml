@@ -123,12 +123,17 @@ command = ["grok"]
 # repo's workspace. If a worktree for the chosen name already exists it is
 # reopened (or its open workspace reused) instead of being recreated.
 #
-# Flow:
-#   1. Repository: [worktree.repos] entry for the issue's project key (e.g.
-#      "PROJ" for PROJ-1666), else `repo`, else you are asked (directory
-#      picker, or type a path).
-#   2. Worktree/branch name: an input prefilled from `branch`; edit it and
-#      press Enter.
+# Flow (`Esc` goes back one step):
+#   1. Project: [worktree.repos] entry for the issue's project key (e.g.
+#      "PROJ" for PROJ-1666), else `repo`, else you pick one of the git
+#      projects (source repositories) herdr has open — like herdr's own
+#      worktree creation. The current workspace's project (★) comes first;
+#      a workspace on a linked worktree counts as its source repo. The last
+#      row, "type path…", takes any repo directory.
+#   2. Worktree: the project's worktrees (`herdr worktree list`). Row 1 is
+#      "+ new worktree": an input prefilled from `branch`; edit it and press
+#      Enter. Picking an existing worktree reopens it (preselected when the
+#      issue's `branch` already has one).
 #   3. Agent: "no agent" just opens the worktree; picking one of the
 #      [[delegate.agents]] starts it in the worktree and sends it the Jira
 #      prompt, exactly like `d` (uses the [delegate] prompt/submit/delay
@@ -139,8 +144,8 @@ command = ["grok"]
 #
 # This table must come AFTER the [[delegate.agents]] entries above.
 [worktree]
-# Default repository for `w` (empty/unset = ask each time). `~` and $HOME are
-# expanded.
+# Default repository for `w` (empty/unset = pick a herdr project each time).
+# `~` and $HOME are expanded.
 # repo = "~/workspace/project"
 
 # Prefill for the worktree (branch) name input. The branch is created, or

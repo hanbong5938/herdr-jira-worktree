@@ -33,6 +33,13 @@ pub struct Transition {
     pub to_status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub author: String,
+    pub created: String, // "YYYY-MM-DD HH:MM", like Issue.updated
+    pub body: String,
+}
+
 #[derive(Clone)]
 pub struct JiraClient {
     base: String,
@@ -41,7 +48,8 @@ pub struct JiraClient {
     agent: ureq::Agent,
 }
 
-const FIELDS: &str = "summary,status,issuetype,priority,assignee,reporter,updated,labels,description";
+const FIELDS: &str =
+    "summary,status,issuetype,priority,assignee,reporter,updated,labels,description";
 
 impl JiraClient {
     pub fn new(cfg: &crate::config::Config) -> Result<Self, String> {
@@ -58,7 +66,11 @@ impl JiraClient {
                     base64::engine::general_purpose::STANDARD.encode(creds)
                 )
             }
-            other => return Err(format!("unknown [jira].auth \"{other}\" (use basic|bearer)")),
+            other => {
+                return Err(format!(
+                    "unknown [jira].auth \"{other}\" (use basic|bearer)"
+                ))
+            }
         };
         Ok(Self {
             base: cfg.jira.base_url.clone(),
@@ -110,15 +122,15 @@ impl JiraClient {
 
     pub fn search(&self, jql: &str) -> Result<Vec<Issue>, String> {
         let max = self.max_results.to_string();
-        let query: &[(&str, &str)] = &[
-            ("jql", jql),
-            ("maxResults", &max),
-            ("fields", FIELDS),
-        ];
+        let query: &[(&str, &str)] = &[("jql", jql), ("maxResults", &max), ("fields", FIELDS)];
         // New endpoint first (Jira Cloud), classic /search as fallback (Server/DC).
         let result = match self.get("/rest/api/2/search/jql", query) {
             Ok(v) => Ok(v),
-            Err(e) if e.starts_with("HTTP 404") || e.starts_with("HTTP 405") || e.starts_with("HTTP 410") => {
+            Err(e)
+                if e.starts_with("HTTP 404")
+                    || e.starts_with("HTTP 405")
+                    || e.starts_with("HTTP 410") =>
+            {
                 self.get("/rest/api/2/search", query)
             }
             Err(e) => Err(e),
@@ -136,13 +148,6 @@ impl JiraClient {
     fn parse_issue(&self, v: &Value) -> Issue {
         let f = &v["fields"];
         let key = v["key"].as_str().unwrap_or("?").to_string();
-        let person = |p: &Value| -> String {
-            p["displayName"]
-                .as_str()
-                .or_else(|| p["name"].as_str())
-                .unwrap_or("—")
-                .to_string()
-        };
         Issue {
             url: format!("{}/browse/{}", self.base, key),
             key,
@@ -156,10 +161,7 @@ impl JiraClient {
             priority: f["priority"]["name"].as_str().unwrap_or("—").to_string(),
             assignee: person(&f["assignee"]),
             reporter: person(&f["reporter"]),
-            updated: f["updated"]
-                .as_str()
-                .map(|s| s.chars().take(16).collect::<String>().replace('T', " "))
-                .unwrap_or_default(),
+            updated: f["updated"].as_str().map(short_time).unwrap_or_default(),
             labels: f["labels"]
                 .as_array()
                 .map(|a| {
@@ -194,6 +196,52 @@ impl JiraClient {
         )?;
         Ok(())
     }
+
+    pub fn comments(&self, key: &str) -> Result<Vec<Comment>, String> {
+        let v = self.get(
+            &format!("/rest/api/2/issue/{key}/comment"),
+            &[("orderBy", "-created"), ("maxResults", "50")],
+        )?;
+        Ok(parse_comments(&v))
+    }
+}
+
+/// Display name of a Jira user object, falling back to the login name.
+fn person(p: &Value) -> String {
+    p["displayName"]
+        .as_str()
+        .or_else(|| p["name"].as_str())
+        .unwrap_or("—")
+        .to_string()
+}
+
+/// "2024-01-02T10:00:00.000+0000" → "2024-01-02 10:00".
+fn short_time(s: &str) -> String {
+    s.chars().take(16).collect::<String>().replace('T', " ")
+}
+
+/// Parse a `/issue/{key}/comment` payload, newest first. Server/DC may ignore
+/// `orderBy`, so sort client-side on the raw ISO timestamp.
+pub fn parse_comments(v: &Value) -> Vec<Comment> {
+    let mut raw: Vec<(&str, Comment)> = v["comments"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let created = c["created"].as_str().unwrap_or("");
+            (
+                created,
+                Comment {
+                    author: person(&c["author"]),
+                    created: short_time(created),
+                    body: description_text(&c["body"]),
+                },
+            )
+        })
+        .collect();
+    raw.sort_by(|a, b| b.0.cmp(a.0));
+    raw.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Jira error payloads look like {"errorMessages":[...],"errors":{...}}.
@@ -204,9 +252,10 @@ fn extract_error(body: &str) -> String {
             parts.extend(msgs.iter().filter_map(|m| m.as_str().map(String::from)));
         }
         if let Some(errs) = v["errors"].as_object() {
-            parts.extend(errs.iter().map(|(k, val)| {
-                format!("{k}: {}", val.as_str().unwrap_or_default())
-            }));
+            parts.extend(
+                errs.iter()
+                    .map(|(k, val)| format!("{k}: {}", val.as_str().unwrap_or_default())),
+            );
         }
         if !parts.is_empty() {
             return parts.join("; ");
@@ -240,7 +289,10 @@ mod tests {
 
     #[test]
     fn description_plain_string_passes_through() {
-        assert_eq!(description_text(&Value::String("hi\nthere".into())), "hi\nthere");
+        assert_eq!(
+            description_text(&Value::String("hi\nthere".into())),
+            "hi\nthere"
+        );
         assert_eq!(description_text(&Value::Null), "");
     }
 
@@ -269,6 +321,37 @@ mod tests {
         let body = r#"{"errorMessages":["Issue does not exist"],"errors":{"status":"bad"}}"#;
         assert_eq!(extract_error(body), "Issue does not exist; status: bad");
         assert_eq!(extract_error("plain"), "plain");
+    }
+
+    #[test]
+    fn comments_parse_plain_and_adf_newest_first() {
+        let v = serde_json::json!({
+            "comments": [
+                {
+                    "author": {"name": "jdoe"},
+                    "created": "2024-01-02T10:00:00.000+0000",
+                    "body": "older plain"
+                },
+                {
+                    "author": {"displayName": "Ann Lee", "name": "alee"},
+                    "created": "2024-03-05T08:30:00.000+0000",
+                    "body": {"type": "doc", "version": 1, "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "newer adf"}]}
+                    ]}
+                },
+                {"created": "2023-12-31T23:59:00.000+0000", "body": null}
+            ]
+        });
+        let cs = parse_comments(&v);
+        assert_eq!(cs.len(), 3);
+        assert_eq!(cs[0].author, "Ann Lee");
+        assert_eq!(cs[0].created, "2024-03-05 08:30");
+        assert_eq!(cs[0].body, "newer adf");
+        assert_eq!(cs[1].author, "jdoe");
+        assert_eq!(cs[1].body, "older plain");
+        assert_eq!(cs[2].author, "—");
+        assert_eq!(cs[2].body, "");
+        assert!(parse_comments(&Value::Null).is_empty());
     }
 }
 
