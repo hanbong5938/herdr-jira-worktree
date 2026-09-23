@@ -1,5 +1,7 @@
 # herdr-jira-worktree
 
+**English** | [한국어](README.ko.md)
+
 Fork of [a2u/herdr-jira](https://github.com/a2u/herdr-jira) by Vitalii Rudnykh,
 adding a `w` key that checks out a Jira issue into a new or existing git
 worktree per herdr project, and issue comments in the details view. Versioned
