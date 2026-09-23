@@ -193,7 +193,8 @@ command = "han.jira-worktree.open-jira-tab"
 프롬프트를 전달하고 제출하므로, 붙여 넣은 텍스트와 Enter 사이의 경쟁 상태가
 생기지 않습니다. `submit = false`이면 `herdr pane send-text <pane-id> <text>`로
 텍스트만 붙여 넣습니다. 예전 `submit_delay_ms` 설정은 받아들이지만 더 이상 쓰지
-않습니다. 전달 오류는 raw 입력으로 재시도하지 않고 그대로 표시합니다. 프롬프트가
+않습니다. `w`로 시작한 에이전트에는 `[worktree].submit`이 우선합니다(아래 참고).
+전달 오류는 raw 입력으로 재시도하지 않고 그대로 표시합니다. 프롬프트가
 중복되거나 시작 대화상자에 입력되는 것을 막기 위해서입니다.
 
 ### 새 에이전트 시작
@@ -252,7 +253,10 @@ idle 대기는 하나의 `wait_ready_ms` 예산을 공유합니다. 준비에 �
 3. **에이전트** — **no agent**는 worktree workspace만 엽니다. 또는
    `[[delegate.agents]]`에서 에이전트를 골라 그 안에서 시작하고 Jira
    프롬프트를 보냅니다. `d`와 똑같이 동작합니다(같은 `[delegate]`
-   prompt/submit/준비 대기 설정).
+   prompt/준비 대기 설정; `submit`은 `[worktree].submit`을 지정하지 않으면
+   `[delegate].submit`을 따름). `[worktree] submit = false`면 프롬프트를
+   에이전트 입력창에 붙여 넣기만 하고(토스트: "… pasted into … — review and
+   press Enter"), 직접 고친 뒤 Enter를 누르면 됩니다. `d`는 그대로 제출합니다.
 
 `config.toml` 끝(`[[delegate.agents]]` 뒤)에 `[worktree]` 테이블을 추가합니다:
 
@@ -265,6 +269,7 @@ focus = true                           # worktree workspace로 포커스 이동
 # path = "~/worktrees/{branch}"        # checkout 경로 (기본: herdr의 worktrees 디렉터리)
 # label = "{key}"                      # workspace 라벨
 # trust_repository = false             # --trust-repository 전달; 검증한 저장소에만
+# submit = false                       # 생략 = [delegate].submit; false = 붙여 넣기만, Enter는 직접
 
 [worktree.repos]                       # Jira 프로젝트 키별
 PROJ = "~/workspace/project"
