@@ -192,6 +192,7 @@ With `submit = true`, `herdr agent prompt <pane-id> <text>` delivers and
 submits the prompt server-side, avoiding a race between pasted text and Enter.
 With `submit = false`, `herdr pane send-text <pane-id> <text>` only pastes the
 text. The legacy `submit_delay_ms` setting is accepted but no longer used.
+`[worktree].submit` overrides this for agents started by `w` (see below).
 Delivery errors are shown without retrying through raw input, to avoid duplicate
 prompts or typing into a startup dialog.
 
@@ -249,7 +250,11 @@ goes back one step:
    preselected when it already exists.
 3. **Agent** — **no agent** just opens the worktree workspace; or pick an agent
    from `[[delegate.agents]]` to start it there and send the Jira prompt,
-   exactly like `d` (same `[delegate]` prompt/submit/readiness settings).
+   exactly like `d` (same `[delegate]` prompt/readiness settings; `submit`
+   follows `[delegate].submit` unless `[worktree].submit` is set). With
+   `[worktree] submit = false` the prompt is only pasted into the agent's input
+   — the toast reads "… pasted into … — review and press Enter" — so you can
+   edit it and press Enter yourself, while `d` keeps submitting.
 
 Add a `[worktree]` table at the end of `config.toml` (after `[[delegate.agents]]`):
 
@@ -262,6 +267,7 @@ focus = true                           # focus the worktree workspace
 # path = "~/worktrees/{branch}"        # checkout path (default: herdr's worktrees dir)
 # label = "{key}"                      # workspace label
 # trust_repository = false             # passes --trust-repository; verified repos only
+# submit = false                       # unset = [delegate].submit; false = paste only, you press Enter
 
 [worktree.repos]                       # per Jira project key
 PROJ = "~/workspace/project"

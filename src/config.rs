@@ -134,6 +134,10 @@ pub struct WorktreeConfig {
     /// Focus the worktree workspace after opening it. Default true.
     #[serde(default = "default_true")]
     pub focus: bool,
+    /// Submit the Jira prompt to an agent started in the worktree. Unset =
+    /// `[delegate].submit`; false only pastes it so it can be edited first.
+    #[serde(default)]
+    pub submit: Option<bool>,
 }
 
 impl Default for WorktreeConfig {
@@ -147,6 +151,7 @@ impl Default for WorktreeConfig {
             label: default_worktree_label(),
             trust_repository: false,
             focus: true,
+            submit: None,
         }
     }
 }
@@ -318,6 +323,8 @@ mod tests {
         assert!(cfg.worktree.trust_repository);
         assert_eq!(cfg.worktree.branch, "{key}");
         assert!(cfg.worktree.focus);
+        // `submit` ships commented out, so the worktree inherits [delegate].submit.
+        assert_eq!(cfg.worktree.submit, None);
     }
 
     const MINIMAL: &str = r#"
@@ -362,6 +369,24 @@ placement = "tab"
         assert_eq!(wt.base, "");
         assert_eq!(wt.path, "");
         assert_eq!(cfg.delegate.placement, "tab");
+        assert_eq!(wt.submit, None);
+    }
+
+    #[test]
+    fn worktree_submit_overrides_delegate_submit() {
+        let raw = r#"
+[jira]
+base_url = "https://example.atlassian.net"
+
+[delegate]
+submit = true
+
+[worktree]
+submit = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.delegate.submit);
+        assert_eq!(cfg.worktree.submit, Some(false));
     }
 
     #[test]

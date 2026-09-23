@@ -60,6 +60,8 @@ pub enum Resp {
     Delegated {
         key: String,
         label: String,
+        /// Enter was sent; false = the prompt was only pasted for review.
+        submitted: bool,
         result: Result<(), String>,
     },
     /// `w` without an agent: `result` is the checkout path.
@@ -529,6 +531,7 @@ impl App {
             let _ = tx.send(Resp::Delegated {
                 key,
                 label: agent.label,
+                submitted: submit,
                 result,
             });
         });
@@ -605,7 +608,12 @@ impl App {
                 Err(_) => agent_label,
             };
             let result = result.map(|_| ());
-            let _ = tx.send(Resp::Delegated { key, label, result });
+            let _ = tx.send(Resp::Delegated {
+                key,
+                label,
+                submitted: submit,
+                result,
+            });
         });
     }
 
@@ -789,7 +797,7 @@ impl App {
         };
         let text = build_prompt(&self.cfg, issue);
         let key = issue.key.clone();
-        let submit = self.cfg.delegate.submit;
+        let submit = self.cfg.worktree.submit.unwrap_or(self.cfg.delegate.submit);
         let delay = self.cfg.delegate.submit_delay_ms;
         let startup = self.cfg.delegate.startup_delay_ms;
         let wait_ready = self.cfg.delegate.wait_ready_ms;
@@ -816,7 +824,12 @@ impl App {
                 Err(_) => agent_label,
             };
             let result = result.map(|_| ());
-            let _ = tx.send(Resp::Delegated { key, label, result });
+            let _ = tx.send(Resp::Delegated {
+                key,
+                label,
+                submitted: submit,
+                result,
+            });
         });
     }
 
@@ -933,10 +946,22 @@ impl App {
                     }
                 }
             }
-            Resp::Delegated { key, label, result } => match result {
-                Ok(()) => {
+            Resp::Delegated {
+                key,
+                label,
+                submitted,
+                result,
+            } => match result {
+                Ok(()) if submitted => {
                     self.toast(format!("{key} delegated to {label}"), false);
                     herdr::notify(&format!("Jira {key} delegated to {label}"));
+                }
+                Ok(()) => {
+                    self.toast(
+                        format!("{key} pasted into {label} — review and press Enter"),
+                        false,
+                    );
+                    herdr::notify(&format!("Jira {key} pasted into {label}"));
                 }
                 Err(e) => self.toast(format!("delegate {key}: {e}"), true),
             },

@@ -136,8 +136,8 @@ command = ["grok"]
 #      issue's `branch` already has one).
 #   3. Agent: "no agent" just opens the worktree; picking one of the
 #      [[delegate.agents]] starts it in the worktree and sends it the Jira
-#      prompt, exactly like `d` (uses the [delegate] prompt/submit/delay
-#      settings).
+#      prompt, exactly like `d` (uses the [delegate] prompt/delay settings and
+#      [delegate].submit, unless [worktree].submit is set).
 #
 # Template placeholders: {key} (issue key), {slug} (summary slug),
 # {type} (issue type); path and label also accept {branch}.
@@ -169,6 +169,11 @@ trust_repository = false
 
 # Focus the worktree workspace after opening it.
 focus = true
+
+# Submit the Jira prompt to the agent started in the worktree.
+# Unset = follow [delegate].submit. false = only paste it into the agent's
+# input so you can edit it and press Enter yourself.
+# submit = false
 
 # Per Jira project key repositories; take precedence over `repo`.
 # Keep this sub-table LAST: keys after it belong to [worktree.repos].
