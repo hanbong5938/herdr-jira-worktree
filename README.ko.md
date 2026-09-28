@@ -179,9 +179,6 @@ jql = "project = {project} AND statusCategory != Done ORDER BY updated DESC"
 prompt = """
 You are asked to work on Jira issue {key}: {summary}
 Link: {url}
-
-Description:
-{description}
 """
 submit = true          # 서버 쪽에서 제출; false면 텍스트만 붙여 넣음
 
@@ -264,6 +261,29 @@ command = "han.jira-worktree.open-jira-tab"
 
 `{key}` `{summary}` `{description}` `{url}` `{status}` `{assignee}`
 `{reporter}` `{priority}` `{type}` `{labels}`
+
+기본 프롬프트는 이슈 키, 요약, 링크만 보냅니다. 설명과 **댓글**은 에이전트가
+직접 읽으므로 같은 내용이 두 번 전달되지 않습니다. `{url}`은 브라우저 링크라
+Jira에 로그인하지 않으면 로그인 페이지만 보입니다. 그래서 에이전트에게 Jira
+접근 수단이 따로 있어야 합니다. Jira MCP/CLI를 쓰거나, 셸에 인증 정보를 두고
+REST API(`GET <site>/rest/api/2/issue/<KEY>?fields=summary,description,comment`)를
+호출하면 됩니다. 위의 Keychain `api_token_cmd`는 이 플러그인만 씁니다.
+에이전트도 같은 토큰을 쓰게 하려면 셸 프로필에서 토큰을 export하세요.
+
+에이전트가 Jira에 접근할 수 없으면 템플릿에 `{description}`을 넣어 설명을
+프롬프트에 붙이세요(`max_description_chars`, 기본 6000자를 넘으면 잘림):
+
+```toml
+prompt = """
+You are asked to work on Jira issue {key}: {summary}
+Link: {url}
+
+Description:
+{description}
+"""
+```
+
+댓글은 어떤 경우에도 프롬프트에 들어가지 않습니다.
 
 `submit = true`이면 `herdr agent prompt <pane-id> <text>`가 서버 쪽에서
 프롬프트를 전달하고 제출하므로, 붙여 넣은 텍스트와 Enter 사이의 경쟁 상태가

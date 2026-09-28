@@ -57,17 +57,13 @@ jql = 'text ~ "{query}" ORDER BY updated DESC'
 # Prompt sent to the agent you pick with `d`. Placeholders:
 #   {key} {summary} {description} {url} {status} {assignee} {reporter}
 #   {priority} {type} {labels}
+# The default sends only the link: an agent with Jira access reads the issue
+# (description and comments) itself, so nothing is sent twice. Add
+# {description} to paste the description into the prompt instead (comments are
+# never included); it is cut after max_description_chars.
 prompt = """
 You are asked to work on Jira issue {key}: {summary}
-
-Status: {status} | Assignee: {assignee} | Priority: {priority} | Type: {type}
 Link: {url}
-
-Description:
-{description}
-
-Please analyze the issue, implement the fix or feature it describes, and
-summarize what you changed when you are done.
 """
 
 # Deliver and submit via `herdr agent prompt`; false only pastes the text.

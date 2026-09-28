@@ -216,11 +216,7 @@ fn default_spawn_agents() -> Vec<SpawnAgent> {
         .collect()
 }
 fn default_prompt() -> String {
-    "You are asked to work on Jira issue {key}: {summary}\n\n\
-     Link: {url}\n\nDescription:\n{description}\n\n\
-     Please analyze the issue, implement what it describes, and summarize \
-     what you changed when you are done."
-        .into()
+    "You are asked to work on Jira issue {key}: {summary}\nLink: {url}".into()
 }
 
 pub fn config_path() -> PathBuf {
