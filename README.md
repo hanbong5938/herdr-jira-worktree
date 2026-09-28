@@ -183,9 +183,6 @@ jql = "project = {project} AND statusCategory != Done ORDER BY updated DESC"
 prompt = """
 You are asked to work on Jira issue {key}: {summary}
 Link: {url}
-
-Description:
-{description}
 """
 submit = true          # submit server-side; false only pastes the text
 
@@ -268,6 +265,30 @@ command = "han.jira-worktree.open-jira-tab"
 
 `{key}` `{summary}` `{description}` `{url}` `{status}` `{assignee}`
 `{reporter}` `{priority}` `{type}` `{labels}`
+
+The default prompt sends only the issue key, summary and link. The agent is
+expected to read the issue itself — description **and comments** — so the
+content isn't sent twice. `{url}` is a browser link that shows a sign-in page
+without a Jira login, so the agent needs its own Jira access: a Jira MCP/CLI,
+or credentials in its shell to call the REST API
+(`GET <site>/rest/api/2/issue/<KEY>?fields=summary,description,comment`).
+The Keychain `api_token_cmd` above is used only by this plugin; export the
+token in your shell profile if agents should use it too.
+
+Without agent-side Jira access, add `{description}` to the template to paste the
+description into the prompt (cut after `max_description_chars`, default 6000):
+
+```toml
+prompt = """
+You are asked to work on Jira issue {key}: {summary}
+Link: {url}
+
+Description:
+{description}
+"""
+```
+
+Comments are never included in the prompt.
 
 With `submit = true`, `herdr agent prompt <pane-id> <text>` delivers and
 submits the prompt server-side, avoiding a race between pasted text and Enter.
