@@ -22,6 +22,82 @@ template (issue key, summary, description, link, …).
  Enter open · w worktree · d delegate · s status · f filters · / search · ? help
 ```
 
+## What this fork adds
+
+Both work out of the box — no extra config needed beyond the Jira connection.
+
+### Issue comments
+
+Press `Enter` on an issue. The details view shows the description on top and
+the issue's comments (newest first) below it. `Tab` switches which pane `j`/`k`
+scrolls; `Esc` goes back to the list.
+
+```
+╭ issue ───────────────────────────────────────────────────────────────────╮
+│ PROJ-142  Fix login crash on iOS 17                                      │
+│                                                                          │
+│ Status    In Progress                                                    │
+│ Assignee  Vitalii R.                                                     │
+│ Link      https://yourcompany.atlassian.net/browse/PROJ-142              │
+│                                                                          │
+│ Description                                                              │
+│ The app crashes right after tapping "Sign in" on iOS 17.                 │
+╰──────────────────────────────────────────────────────────────────────────╯
+╭ comments · PROJ-142 (2) ─────────────────────────────────────────────────╮
+│ Jane Doe  2026-07-14 09:12                                               │
+│ Reproduced on 17.5, crash log attached.                                  │
+│                                                                          │
+│ Vitalii R.  2026-07-13 18:55                                             │
+│ Probably the keychain migration.                                         │
+╰──────────────────────────────────────────────────────────────────────────╯
+j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  Esc back
+```
+
+### Issue → git worktree (`w`)
+
+Press `w` on an issue (in the list or the details view) to work on it in its
+own git worktree, opened as a herdr workspace. Three quick picks; `Esc` goes
+back one step, `1`–`9` picks a row directly.
+
+**1. Project** — the git projects open in herdr, the current one first (★).
+`type path…` takes any other repo.
+
+```
+╭ worktree for PROJ-142 — project ─────────────────────────────────────╮
+│herdr projects (source checkouts) · ★ current workspace               │
+│▸ 1. ★ mobile-app  /Users/you/workspace/mobile-app  (1 open worktree) │
+│  2.   backend     /Users/you/workspace/backend                       │
+│  3. type path…  (/)                                                  │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+**2. Worktree** — `+ new worktree` creates a branch named after the issue (you
+can edit the name before `Enter`), or pick an existing worktree to reopen it.
+
+```
+╭ worktree for PROJ-142 — mobile-app ──────────────────────────────────╮
+│create a worktree or reopen one of /Users/you/workspace/mobile-app    │
+│▸ 1. + new worktree (PROJ-142)                                        │
+│  2. main      /Users/you/workspace/mobile-app  (source)  [open]      │
+│  3. PROJ-120  /Users/you/.herdr/worktrees/mobile-app/PROJ-120  [open]│
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+**3. Agent** — just open the worktree, or start an agent from
+`[[delegate.agents]]` in it; the agent receives the Jira issue as its prompt.
+
+```
+╭ worktree PROJ-142 — start an agent? ──────╮
+│▸ 1. no agent — just open the worktree     │
+│  2. claude      claude                    │
+│  3. codex       codex                     │
+╰───────────────────────────────────────────╯
+```
+
+herdr opens the worktree as a new workspace grouped with the project. To skip
+step 1, map Jira projects to repos in `[worktree.repos]`; see
+[Worktrees (`w`)](#worktrees-w) for all options.
+
 ## Features
 
 - **Filters** — named JQL filters from the config (`f` or `1`–`9`): my issues,

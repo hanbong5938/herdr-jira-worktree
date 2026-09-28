@@ -22,6 +22,82 @@ worktree로 여는 `w` 키와, 이슈 상세 화면의 댓글 보기가 추가�
  Enter open · w worktree · d delegate · s status · f filters · / search · ? help
 ```
 
+## 이 포크에서 추가된 기능
+
+둘 다 Jira 연결 설정만 있으면 추가 설정 없이 바로 쓸 수 있습니다.
+
+### 이슈 댓글
+
+이슈에서 `Enter`를 누르면 상세 화면이 열리고, 위에는 설명이, 아래에는 이슈
+댓글(최신순)이 표시됩니다. `Tab`으로 `j`/`k`가 스크롤할 쪽을 바꾸고, `Esc`로
+목록으로 돌아갑니다.
+
+```
+╭ issue ───────────────────────────────────────────────────────────────────╮
+│ PROJ-142  Fix login crash on iOS 17                                      │
+│                                                                          │
+│ Status    In Progress                                                    │
+│ Assignee  Vitalii R.                                                     │
+│ Link      https://yourcompany.atlassian.net/browse/PROJ-142              │
+│                                                                          │
+│ Description                                                              │
+│ The app crashes right after tapping "Sign in" on iOS 17.                 │
+╰──────────────────────────────────────────────────────────────────────────╯
+╭ comments · PROJ-142 (2) ─────────────────────────────────────────────────╮
+│ Jane Doe  2026-07-14 09:12                                               │
+│ Reproduced on 17.5, crash log attached.                                  │
+│                                                                          │
+│ Vitalii R.  2026-07-13 18:55                                             │
+│ Probably the keychain migration.                                         │
+╰──────────────────────────────────────────────────────────────────────────╯
+j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  Esc back
+```
+
+### 이슈 → git worktree (`w`)
+
+이슈에서(목록이든 상세 화면이든) `w`를 누르면 그 이슈 전용 git worktree를
+herdr workspace로 열어 작업할 수 있습니다. 세 번만 고르면 되고, `Esc`는 한
+단계 뒤로, `1`–`9`는 해당 줄을 바로 선택합니다.
+
+**1. 프로젝트** — herdr에 열려 있는 git 프로젝트 목록이며, 현재 프로젝트가 맨
+위(★)입니다. `type path…`로 다른 저장소 경로를 직접 입력할 수 있습니다.
+
+```
+╭ worktree for PROJ-142 — project ─────────────────────────────────────╮
+│herdr projects (source checkouts) · ★ current workspace               │
+│▸ 1. ★ mobile-app  /Users/you/workspace/mobile-app  (1 open worktree) │
+│  2.   backend     /Users/you/workspace/backend                       │
+│  3. type path…  (/)                                                  │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+**2. Worktree** — `+ new worktree`는 이슈 키 이름의 브랜치를 만들고(`Enter`
+전에 이름 수정 가능), 기존 worktree를 고르면 그것을 다시 엽니다.
+
+```
+╭ worktree for PROJ-142 — mobile-app ──────────────────────────────────╮
+│create a worktree or reopen one of /Users/you/workspace/mobile-app    │
+│▸ 1. + new worktree (PROJ-142)                                        │
+│  2. main      /Users/you/workspace/mobile-app  (source)  [open]      │
+│  3. PROJ-120  /Users/you/.herdr/worktrees/mobile-app/PROJ-120  [open]│
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+**3. 에이전트** — worktree만 열거나, `[[delegate.agents]]`의 에이전트를 그
+안에서 시작합니다. 에이전트는 Jira 이슈 내용을 프롬프트로 받습니다.
+
+```
+╭ worktree PROJ-142 — start an agent? ──────╮
+│▸ 1. no agent — just open the worktree     │
+│  2. claude      claude                    │
+│  3. codex       codex                     │
+╰───────────────────────────────────────────╯
+```
+
+herdr는 worktree를 프로젝트와 묶인 새 workspace로 엽니다. 1단계를 건너뛰려면
+`[worktree.repos]`에 Jira 프로젝트별 저장소를 지정하세요. 전체 옵션은
+[Worktree (`w`)](#worktree-w)를 참고하세요.
+
 ## 기능
 
 - **필터** — 설정 파일에 이름을 붙여 둔 JQL 필터(`f` 또는 `1`–`9`): 내 이슈,
