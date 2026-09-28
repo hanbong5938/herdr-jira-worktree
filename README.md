@@ -29,8 +29,11 @@ Both work out of the box — no extra config needed beyond the Jira connection.
 ### Issue comments
 
 Press `Enter` on an issue. The details view shows the description on top and
-the issue's comments (newest first) below it. `Tab` switches which pane `j`/`k`
-scrolls; `Esc` goes back to the list.
+the issue's comments (newest first) below it. `Tab` or a mouse click switches
+which pane `j`/`k` (`PgUp`/`PgDn`, `g`/`G`) scrolls; the mouse wheel scrolls the
+pane under the cursor. A scrollbar appears when a pane overflows, and ` … ` on
+the comments pane's bottom border means more comments are below. `Esc` goes
+back to the list.
 
 ```
 ╭ issue ───────────────────────────────────────────────────────────────────╮
@@ -110,8 +113,8 @@ step 1, map Jira projects to repos in `[worktree.repos]`; see
 - **Issue details** — `Enter` opens a scrollable view with the description
   (Cloud ADF documents are flattened to plain text).
 - **Comments** — the issue details view (`Enter`) shows the issue's comments
-  (newest first) in a pane under the description; `Tab` switches scrolling
-  between the description and the comments. Comments are cached per issue;
+  (newest first) in a pane under the description; `Tab` or a click switches
+  scrolling between the description and the comments. Comments are cached per issue;
   press `r` in the issue list, then reopen the issue to fetch them again.
 - **Status transitions** — `s` lists the transitions available for the issue
   and applies the one you pick.
@@ -241,9 +244,9 @@ command = "han.jira-worktree.open-jira-tab"
 | --- | --- |
 | `j`/`k`, `↑`/`↓` | move / scroll |
 | `PgUp`/`PgDn` | move / scroll by 15 |
-| `g`/`G`, `Home`/`End` | top / bottom (details: `g` scrolls to top) |
+| `g`/`G`, `Home`/`End` | top / bottom (details: `g`/`G` scroll the focused pane) |
 | `Enter` | open issue details |
-| `Tab` | issue details: switch scrolling between description and comments |
+| `Tab` / click | issue details: switch scrolling between description and comments |
 | `→`/`l`, `←`/`h` | expand / collapse an epic (shows its child issues inline) |
 | `f`, `1`–`9` | switch filter |
 | `/` | search |
@@ -257,7 +260,7 @@ command = "han.jira-worktree.open-jira-tab"
 | `z` | zoom the Jira pane (fullscreen toggle) |
 | `r` | refresh current filter |
 | `R` | reload config |
-| `?` | help |
+| `?` | help (in issue details: the details view's keys) |
 | `Esc` | back / cancel |
 | `q` | quit |
 

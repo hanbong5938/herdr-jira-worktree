@@ -3,14 +3,15 @@
 
 use crate::app::{is_epic, App, View};
 use crate::jira::Comment;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row,
-    Table, TableState, Wrap,
+    Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 use ratatui::Frame;
+use std::cell::Cell as StdCell;
 
 const ACCENT: Color = Color::Cyan;
 
@@ -22,7 +23,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
 
-    match app.view {
+    match app.base_view() {
         View::Detail => draw_detail(f, app, main),
         _ => draw_list(f, app, main),
     }
@@ -43,7 +44,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::WorktreeAgentPicker => draw_worktree_agent_picker(f, app),
         View::SearchInput => draw_search(f, app),
         View::JqlInput => draw_jql(f, app),
-        View::Help => draw_help(f),
+        View::Help => draw_help(f, app.help_return == View::Detail),
         _ => {}
     }
 }
@@ -172,10 +173,13 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         let [top, bottom] =
             Layout::vertical([Constraint::Min(6), Constraint::Percentage(40)]).areas(area);
         draw_comments(f, app, &issue.key, bottom, comments_border);
+        app.detail_comments_area.set(bottom);
         top
     } else {
+        app.detail_comments_area.set(Rect::default());
         area
     };
+    app.detail_issue_area.set(area);
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(issue.key.clone(), Style::new().fg(ACCENT).bold()),
@@ -214,18 +218,21 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(l.to_string()));
     }
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((app.detail_scroll, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(issue_border))
-                .padding(Padding::horizontal(1))
-                .title(Span::styled(" issue ", Style::new().fg(ACCENT).bold())),
-        );
-    f.render_widget(para, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(issue_border))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(" issue ", Style::new().fg(ACCENT).bold()));
+    render_scrolled(
+        f,
+        lines,
+        block,
+        area,
+        app.detail_scroll,
+        &app.detail_scroll_max,
+        false,
+    );
 }
 
 /// Comments pane for `key`: newest first, or its loading / error / empty state.
@@ -244,21 +251,65 @@ fn draw_comments(f: &mut Frame, app: &App, key: &str, area: Rect, border: Color)
         )],
         (None, None) => vec![Line::styled("loading comments…", dim)],
     };
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((app.comment_scroll, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(border))
-                .padding(Padding::horizontal(1))
-                .title(Span::styled(
-                    format!(" comments · {key}{count} "),
-                    Style::new().fg(ACCENT).bold(),
-                )),
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            format!(" comments · {key}{count} "),
+            Style::new().fg(ACCENT).bold(),
+        ));
+    render_scrolled(
+        f,
+        lines,
+        block,
+        area,
+        app.comment_scroll,
+        &app.comment_scroll_max,
+        true,
+    );
+}
+
+/// Wrapped paragraph scrolled to `scroll`, clamped so the last line can't
+/// leave the bottom edge. Publishes that limit to `max` for key handling and
+/// draws a scrollbar on the right border when the content overflows. With
+/// `mark_cut`, a ` … ` on the bottom border flags content hidden below.
+fn render_scrolled(
+    f: &mut Frame,
+    lines: Vec<Line>,
+    mut block: Block,
+    area: Rect,
+    scroll: u16,
+    max: &StdCell<u16>,
+    mark_cut: bool,
+) {
+    let inner = block.inner(area);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Counted before attaching the block: `line_count` doesn't subtract the
+    // block's horizontal borders/padding from `width`.
+    let limit = para
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    max.set(limit);
+    let pos = scroll.min(limit);
+    if mark_cut && pos < limit {
+        block = block.title_bottom(Span::styled(" … ", Style::new().fg(ACCENT).bold()));
+    }
+    f.render_widget(para.scroll((pos, 0)).block(block), area);
+    if limit > 0 {
+        let mut state = ScrollbarState::new(limit as usize + 1)
+            .position(pos as usize)
+            .viewport_content_length(inner.height as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            area.inner(Margin::new(0, 1)),
+            &mut state,
         );
-    f.render_widget(para, area);
+    }
 }
 
 /// Per comment: `author  created` header, the body, then a blank separator.
@@ -302,8 +353,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             return;
         }
     }
-    let hints = match app.view {
-        View::Detail => "j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  s status  ·  o browser  ·  z zoom  ·  Esc back",
+    let hints = match app.base_view() {
+        View::Detail => "j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  s status  ·  o browser  ·  z zoom  ·  Esc back  ·  ? help",
         View::SearchInput => "Enter search  ·  Esc cancel",
         View::JqlInput => "Enter run JQL  ·  Ctrl-U clear  ·  Esc cancel",
         View::NewAgentCwdInput => "Enter start  ·  Ctrl-U clear  ·  Esc back",
@@ -886,29 +937,52 @@ fn draw_jql(f: &mut Frame, app: &App) {
     );
 }
 
-fn draw_help(f: &mut Frame) {
-    let inner = popup(f, "help", 60, 22);
-    let rows = [
-        ("j/k ↑/↓", "move / scroll"),
-        ("Enter", "open issue details"),
-        ("→/l ←/h", "expand / collapse epic"),
-        ("f, 1-9", "switch filter"),
-        ("/", "search (text ~ query)"),
-        ("J", "run custom JQL (prefilled with current)"),
-        ("1-9", "quick pick in any popup"),
-        ("s", "change issue status"),
-        ("d", "delegate issue to an agent"),
-        ("n", "in delegate picker: start a new agent"),
-        ("w", "git worktree: project → new/existing worktree → agent"),
-        ("o", "open issue in browser"),
-        ("z", "zoom pane (fullscreen toggle)"),
-        ("Tab", "detail: switch scroll focus issue / comments"),
-        ("r", "refresh current filter"),
-        ("R", "reload config.toml"),
-        ("g/G", "top / bottom"),
-        ("Esc", "back / cancel"),
-        ("q", "quit"),
-    ];
+/// Key reference for the list, or for the issue details view when opened
+/// from there.
+fn draw_help(f: &mut Frame, detail: bool) {
+    let rows: &[(&str, &str)] = if detail {
+        &[
+            ("j/k ↑/↓", "scroll the focused pane"),
+            ("PgUp/PgDn", "scroll by 15 lines"),
+            ("g/G", "top / bottom of the focused pane"),
+            ("Tab/click", "switch focus: issue / comments"),
+            ("wheel", "scroll the pane under the cursor"),
+            ("s", "change issue status"),
+            ("d", "delegate issue to an agent"),
+            ("w", "git worktree: project → new/existing worktree → agent"),
+            ("o", "open issue in browser"),
+            ("z", "zoom pane (fullscreen toggle)"),
+            ("?", "this help"),
+            ("Esc/q", "back to the issue list"),
+        ]
+    } else {
+        &[
+            ("j/k ↑/↓", "move / scroll"),
+            ("Enter", "open issue details (? there for its keys)"),
+            ("→/l ←/h", "expand / collapse epic"),
+            ("f, 1-9", "switch filter"),
+            ("/", "search (text ~ query)"),
+            ("J", "run custom JQL (prefilled with current)"),
+            ("1-9", "quick pick in any popup"),
+            ("s", "change issue status"),
+            ("d", "delegate issue to an agent"),
+            ("n", "in delegate picker: start a new agent"),
+            ("w", "git worktree: project → new/existing worktree → agent"),
+            ("o", "open issue in browser"),
+            ("z", "zoom pane (fullscreen toggle)"),
+            ("r", "refresh current filter"),
+            ("R", "reload config.toml"),
+            ("g/G", "top / bottom"),
+            ("Esc", "back / cancel"),
+            ("q", "quit"),
+        ]
+    };
+    let title = if detail {
+        "help · issue details"
+    } else {
+        "help"
+    };
+    let inner = popup(f, title, 60, rows.len() as u16 + 3);
     let lines: Vec<Line> = rows
         .iter()
         .map(|(k, v)| {
@@ -967,5 +1041,139 @@ mod footer_tests {
         let fitted = fit_hints(list, 60);
         assert!(fitted.contains("w worktree"));
         assert!(fitted.ends_with("? help"));
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use crate::app::{App, View};
+    use crate::jira::{Comment, Issue};
+    use crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+
+    fn render(term: &mut Terminal<TestBackend>, app: &App) -> Buffer {
+        term.draw(|f| super::draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn text(buf: &Buffer) -> String {
+        buf.content()
+            .chunks(buf.area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Detail view of one issue with a 10-comment thread that overflows the
+    /// comments pane; the oldest (last) comment ends with `END-MARKER`.
+    fn detail_app() -> App {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::unloaded(tx);
+        app.issues = vec![Issue {
+            key: "ABC-1".into(),
+            summary: "긴 댓글 스레드".into(),
+            status: "In Progress".into(),
+            status_category: "indeterminate".into(),
+            issue_type: "Task".into(),
+            priority: "Medium".into(),
+            assignee: "홍길동".into(),
+            reporter: "Kim".into(),
+            updated: "2026-09-28 10:00".into(),
+            labels: vec![],
+            description: "설명".into(),
+            url: "https://jira.example/browse/ABC-1".into(),
+        }];
+        // Newest first.
+        let comments: Vec<Comment> = (0..10)
+            .map(|n| Comment {
+                author: format!("작성자 {n}"),
+                created: format!("2026-09-{:02} 09:00", 28 - n),
+                body: format!(
+                    "첫 줄 {n}\n{}\nsecond line {n}{}",
+                    "한글 줄바꿈 테스트 ".repeat(12),
+                    if n == 9 { "\nEND-MARKER" } else { "" }
+                ),
+            })
+            .collect();
+        app.comments.insert("ABC-1".into(), comments);
+        app.view = View::Detail;
+        app
+    }
+
+    #[test]
+    fn comments_pane_scroll_stops_with_last_line_visible() {
+        let mut app = detail_app();
+        app.detail_focus_comments = true;
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let first = render(&mut term, &app);
+        assert!(
+            !text(&first).contains("END-MARKER"),
+            "thread must overflow the pane"
+        );
+        assert!(text(&first).contains(" … "), "cut-off marker missing");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('G')));
+        let bottom = render(&mut term, &app);
+        let max = app.comment_scroll_max.get();
+        assert!(max > 0);
+        assert_eq!(app.comment_scroll, max);
+        assert!(text(&bottom).contains("END-MARKER"), "{}", text(&bottom));
+        assert!(!text(&bottom).contains(" … "), "marker shown at the end");
+
+        // Scrolling further must neither move the offset nor blank the pane.
+        for _ in 0..200 {
+            app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        }
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        let after = render(&mut term, &app);
+        assert_eq!(app.comment_scroll, max);
+        assert_eq!(after, bottom);
+    }
+
+    #[test]
+    fn mouse_click_focuses_pane_and_wheel_scrolls_hovered_pane() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let at = |kind, r: ratatui::layout::Rect| MouseEvent {
+            kind,
+            column: r.x + 2,
+            row: r.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut app = detail_app();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        render(&mut term, &app);
+        let (issue, comments) = (app.detail_issue_area.get(), app.detail_comments_area.get());
+        assert!(!app.detail_focus_comments);
+
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), comments));
+        assert!(app.detail_focus_comments);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), issue));
+        assert!(!app.detail_focus_comments);
+
+        // Wheel follows the cursor, not the keyboard focus.
+        app.on_mouse(at(MouseEventKind::ScrollDown, comments));
+        assert!(app.comment_scroll > 0);
+        assert_eq!(app.detail_scroll, 0);
+        assert!(!app.detail_focus_comments);
+    }
+
+    #[test]
+    fn help_from_detail_lists_detail_keys_and_returns_to_detail() {
+        let mut app = detail_app();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        let shown = text(&render(&mut term, &app));
+        assert!(shown.contains("help · issue details"), "{shown}");
+        assert!(shown.contains("switch focus: issue / comments"));
+        assert!(
+            shown.contains("comments · ABC-1"),
+            "detail stays underneath"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.view, View::Detail);
     }
 }

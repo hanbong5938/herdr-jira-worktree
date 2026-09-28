@@ -7,7 +7,7 @@ description = "Jira TUI plugin for herdr (fork of a2u/herdr-jira): filters, sear
 repository = "https://github.com/hanbong5938/herdr-jira-worktree"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 ureq = { version = "2.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

@@ -9,6 +9,7 @@
 
 use base64::Engine;
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct Issue {
@@ -202,8 +203,99 @@ impl JiraClient {
             &format!("/rest/api/2/issue/{key}/comment"),
             &[("orderBy", "-created"), ("maxResults", "50")],
         )?;
-        Ok(parse_comments(&v))
+        let mut comments = parse_comments(&v);
+        // Cloud wiki bodies reference users as `[~accountid:…]`. Comment
+        // authors name most of them for free; look up the rest in bulk.
+        let mut names = author_names(&v);
+        let mut unknown: Vec<&str> = Vec::new();
+        for c in &comments {
+            for id in mention_ids(&c.body) {
+                if !names.contains_key(id) && !unknown.contains(&id) {
+                    unknown.push(id);
+                }
+            }
+        }
+        let unknown: Vec<String> = unknown.into_iter().map(String::from).collect();
+        for chunk in unknown.chunks(50) {
+            // Best effort: on failure the raw mention stays visible.
+            if let Ok(users) = self.users_bulk(chunk) {
+                names.extend(users);
+            }
+        }
+        for c in &mut comments {
+            c.body = replace_mentions(&c.body, &names);
+        }
+        Ok(comments)
     }
+
+    /// accountId → display name via Cloud's `/user/bulk` (≤ 50 ids per call).
+    fn users_bulk(&self, ids: &[String]) -> Result<HashMap<String, String>, String> {
+        let max = ids.len().to_string();
+        let mut query: Vec<(&str, &str)> = vec![("maxResults", &max)];
+        query.extend(ids.iter().map(|id| ("accountId", id.as_str())));
+        let v = self.get("/rest/api/2/user/bulk", &query)?;
+        Ok(v["values"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(user_entry)
+            .collect())
+    }
+}
+
+/// `(accountId, displayName)` of a Cloud user object.
+fn user_entry(u: &Value) -> Option<(String, String)> {
+    Some((
+        u["accountId"].as_str()?.to_string(),
+        u["displayName"].as_str()?.to_string(),
+    ))
+}
+
+/// accountId → display name for every comment author in a comment payload.
+fn author_names(v: &Value) -> HashMap<String, String> {
+    v["comments"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| user_entry(&c["author"]))
+        .collect()
+}
+
+const MENTION_OPEN: &str = "[~accountid:";
+
+/// Account ids of `[~accountid:…]` mentions in a wiki-markup body.
+fn mention_ids(body: &str) -> impl Iterator<Item = &str> {
+    body.split(MENTION_OPEN)
+        .skip(1)
+        .filter_map(|rest| rest.split_once(']').map(|(id, _)| id))
+}
+
+/// Rewrite `[~accountid:…]` as `@Display Name`; unknown ids stay as-is.
+fn replace_mentions(body: &str, names: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find(MENTION_OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + MENTION_OPEN.len()..];
+        match after
+            .split_once(']')
+            .and_then(|(id, tail)| Some((names.get(id)?, tail)))
+        {
+            Some((name, tail)) => {
+                out.push('@');
+                out.push_str(name);
+                rest = tail;
+            }
+            None => {
+                out.push_str(MENTION_OPEN);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Display name of a Jira user object, falling back to the login name.
@@ -352,6 +444,23 @@ mod tests {
         assert_eq!(cs[2].author, "—");
         assert_eq!(cs[2].body, "");
         assert!(parse_comments(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn account_mentions_become_names_unknown_kept() {
+        let names = HashMap::from([
+            ("a1".to_string(), "류현욱".to_string()),
+            ("b2".to_string(), "Ann Lee".to_string()),
+        ]);
+        let body = "[~accountid:a1] [~accountid:b2]\nhi [~accountid:zz] and [~accountid:a1]. [~accountid:open";
+        assert_eq!(
+            mention_ids(body).collect::<Vec<_>>(),
+            ["a1", "b2", "zz", "a1"]
+        );
+        assert_eq!(
+            replace_mentions(body, &names),
+            "@류현욱 @Ann Lee\nhi [~accountid:zz] and @류현욱. [~accountid:open"
+        );
     }
 }
 

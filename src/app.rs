@@ -4,7 +4,9 @@
 use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
 use crate::jira::{Comment, Issue, JiraClient, Transition};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -96,6 +98,9 @@ pub struct App {
     pub tx: Sender<Resp>,
 
     pub view: View,
+    /// View that `Help` was opened from; drawn under the popup and restored
+    /// when it closes.
+    pub help_return: View,
     pub should_quit: bool,
 
     pub issues: Vec<Issue>,
@@ -154,6 +159,14 @@ pub struct App {
     pub jql_input: String,
     pub last_jql: String,
     pub detail_scroll: u16,
+    /// Largest useful scroll offset per detail pane, written by the renderer
+    /// (it alone knows the wrapped height) so keys can't scroll past the end.
+    pub detail_scroll_max: Cell<u16>,
+    pub comment_scroll_max: Cell<u16>,
+    /// Detail view pane rects from the last render, for mouse hit-testing;
+    /// the comments rect stays empty when the pane is hidden.
+    pub detail_issue_area: Cell<Rect>,
+    pub detail_comments_area: Cell<Rect>,
 
     /// Comments per issue key (newest first), in-flight fetches and failures.
     pub comments: HashMap<String, Vec<Comment>>,
@@ -174,7 +187,8 @@ impl App {
     }
 
     /// Empty state with the built-in default config; `new` then loads the real one.
-    fn unloaded(tx: Sender<Resp>) -> Self {
+    /// Crate-visible so render tests can build an App without config or network.
+    pub(crate) fn unloaded(tx: Sender<Resp>) -> Self {
         Self {
             cfg: Config {
                 jira: crate::config::JiraConfig {
@@ -194,6 +208,7 @@ impl App {
             client: None,
             tx,
             view: View::List,
+            help_return: View::List,
             should_quit: false,
             issues: vec![],
             children: HashMap::new(),
@@ -231,6 +246,10 @@ impl App {
             jql_input: String::new(),
             last_jql: String::new(),
             detail_scroll: 0,
+            detail_scroll_max: Cell::new(0),
+            comment_scroll_max: Cell::new(0),
+            detail_issue_area: Cell::new(Rect::default()),
+            detail_comments_area: Cell::new(Rect::default()),
             comments: HashMap::new(),
             comments_loading: HashSet::new(),
             comments_err: HashMap::new(),
@@ -1035,9 +1054,55 @@ impl App {
             View::SearchInput => self.keys_search(key),
             View::JqlInput => self.keys_jql(key),
             View::Help => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.view = View::List,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                    self.view = self.help_return
+                }
                 _ => {}
             },
+        }
+    }
+
+    /// Detail view: a left click focuses the pane under the cursor and the
+    /// wheel scrolls that pane. Elsewhere the wheel acts as ↑/↓ (what the
+    /// terminal sent before mouse capture was on).
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.fatal.is_some() {
+            return;
+        }
+        let delta = match m.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::Down(MouseButton::Left) if self.view == View::Detail => {
+                if let Some(comments) = self.detail_pane_at(m.column, m.row) {
+                    self.detail_focus_comments = comments;
+                }
+                return;
+            }
+            _ => return,
+        };
+        if self.view == View::Detail {
+            if let Some(comments) = self.detail_pane_at(m.column, m.row) {
+                self.scroll_pane(comments, delta * 3);
+            }
+        } else {
+            let code = if delta > 0 {
+                KeyCode::Down
+            } else {
+                KeyCode::Up
+            };
+            self.on_key(KeyEvent::from(code));
+        }
+    }
+
+    /// `Some(true)` over the comments pane, `Some(false)` over the issue pane.
+    fn detail_pane_at(&self, column: u16, row: u16) -> Option<bool> {
+        let p = Position::new(column, row);
+        if self.detail_comments_area.get().contains(p) {
+            Some(true)
+        } else if self.detail_issue_area.get().contains(p) {
+            Some(false)
+        } else {
+            None
         }
     }
 
@@ -1106,7 +1171,7 @@ impl App {
             KeyCode::Char('w') => self.open_worktree(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
-            KeyCode::Char('?') => self.view = View::Help,
+            KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
     }
@@ -1115,39 +1180,49 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
             KeyCode::Tab => self.detail_focus_comments = !self.detail_focus_comments,
-            KeyCode::Char('j') | KeyCode::Down => {
-                let s = self.focused_scroll();
-                *s = s.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                let s = self.focused_scroll();
-                *s = s.saturating_sub(1)
-            }
-            KeyCode::PageDown => {
-                let s = self.focused_scroll();
-                *s = s.saturating_add(15)
-            }
-            KeyCode::PageUp => {
-                let s = self.focused_scroll();
-                *s = s.saturating_sub(15)
-            }
-            KeyCode::Char('g') => *self.focused_scroll() = 0,
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_focused(-1),
+            KeyCode::PageDown => self.scroll_focused(15),
+            KeyCode::PageUp => self.scroll_focused(-15),
+            KeyCode::Char('g') => self.scroll_focused(i32::MIN),
+            KeyCode::Char('G') => self.scroll_focused(i32::MAX),
             KeyCode::Char('s') => self.request_transitions(),
             KeyCode::Char('d') => self.request_agents(),
             KeyCode::Char('w') => self.open_worktree(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
+            KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
     }
 
-    /// Detail view: scroll offset of the pane that has focus.
-    fn focused_scroll(&mut self) -> &mut u16 {
-        if self.detail_focus_comments {
-            &mut self.comment_scroll
+    fn open_help(&mut self) {
+        self.help_return = self.view;
+        self.view = View::Help;
+    }
+
+    /// View drawn under popups: `Help` shows over the view it came from.
+    pub fn base_view(&self) -> View {
+        if self.view == View::Help {
+            self.help_return
         } else {
-            &mut self.detail_scroll
+            self.view
         }
+    }
+
+    fn scroll_focused(&mut self, delta: i32) {
+        self.scroll_pane(self.detail_focus_comments, delta);
+    }
+
+    /// Detail view: move one pane's scroll by `delta` lines, clamped to
+    /// `0..=max` from the last render.
+    fn scroll_pane(&mut self, comments: bool, delta: i32) {
+        let (s, max) = if comments {
+            (&mut self.comment_scroll, self.comment_scroll_max.get())
+        } else {
+            (&mut self.detail_scroll, self.detail_scroll_max.get())
+        };
+        *s = (i32::from(*s).saturating_add(delta)).clamp(0, i32::from(max)) as u16;
     }
 
     /// Number hotkeys shared by all popup pickers: `1`-`9` picks that row.
