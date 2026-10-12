@@ -357,7 +357,7 @@ fn submitted_multiline_prompt_uses_one_server_side_call() {
         &["agent", "prompt", "w2:p3", &text],
         json!({"result": {}}),
     )]);
-    send_to_agent(&agent(), &text, true, 0).unwrap();
+    send_to_agent(&agent(), &text, true).unwrap();
     mock.assert_complete();
 }
 
@@ -367,7 +367,7 @@ fn unsubmitted_prompt_only_sends_literal_text() {
         &["pane", "send-text", "w2:p3", "one\ntwo"],
         json!({"result": {}}),
     )]);
-    send_to_agent(&agent(), "one\ntwo", false, 0).unwrap();
+    send_to_agent(&agent(), "one\ntwo", false).unwrap();
     mock.assert_complete();
 }
 
@@ -378,7 +378,7 @@ fn prompt_failures_do_not_fall_back_to_raw_input() {
             &["agent", "prompt", "w2:p3", "prompt"],
             code,
         )]);
-        assert!(send_to_agent(&agent(), "prompt", true, 0)
+        assert!(send_to_agent(&agent(), "prompt", true)
             .unwrap_err()
             .contains(code));
         mock.assert_complete();
@@ -413,7 +413,7 @@ fn cold_tab_waits_for_detection_and_idle_before_submitting() {
         ),
     ]);
     let mock = MockCli::new(steps);
-    let started = start_and_delegate(&opts("tab"), "prompt", true, 0, 0, 5000).unwrap();
+    let started = start_and_delegate(&opts("tab"), "prompt", true, 0, 5000).unwrap();
     assert_eq!(started.target, "w2:p3");
     mock.assert_complete();
 }
@@ -438,11 +438,40 @@ fn readiness_failure_aborts_delivery_in_both_submit_modes() {
             ),
         ]);
         let mock = MockCli::new(steps);
-        let error = start_and_delegate(&opts("tab"), "prompt", submit, 0, 0, 5000).unwrap_err();
-        assert!(error.contains("not ready; prompt not sent"));
-        assert!(error.contains("timeout"));
+        let error = start_and_delegate(&opts("tab"), "prompt", submit, 0, 5000).unwrap_err();
+        assert!(error.message.contains("not ready; prompt not sent"));
+        assert!(error.message.contains("timeout"));
+        assert!(error.retry_safe);
+        assert_eq!(error.agent.unwrap().pane_id, "w2:p3");
         mock.assert_complete();
     }
+}
+
+#[test]
+fn failed_send_retains_pane_but_cannot_offer_a_safe_retry() {
+    let mut steps = tab_start_steps();
+    steps.extend([
+        Step::ok(&["agent", "get", "w2:p3"], json!({"result": {"agent": {}}})),
+        Step::ok(
+            &[
+                "agent",
+                "wait",
+                "w2:p3",
+                "--until",
+                "idle",
+                "--timeout",
+                "TIMEOUT<=5000",
+            ],
+            json!({"result": {}}),
+        ),
+        Step::error(&["agent", "prompt", "w2:p3", "prompt"], "timeout"),
+    ]);
+    let mock = MockCli::new(steps);
+    let error = start_and_delegate(&opts("tab"), "prompt", true, 0, 5000).unwrap_err();
+    assert_eq!(error.agent.unwrap().pane_id, "w2:p3");
+    assert!(!error.retry_safe);
+    assert!(error.message.contains("timeout"));
+    mock.assert_complete();
 }
 
 #[test]
@@ -452,8 +481,10 @@ fn detection_timeout_aborts_delivery() {
     missing.delay_ms = 50;
     steps.push(missing);
     let mock = MockCli::new(steps);
-    let error = start_and_delegate(&opts("tab"), "prompt", true, 0, 0, 20).unwrap_err();
-    assert!(error.contains("not detected within 20ms"));
+    let error = start_and_delegate(&opts("tab"), "prompt", true, 0, 20).unwrap_err();
+    assert!(error.message.contains("not detected within 20ms"));
+    assert!(error.retry_safe);
+    assert_eq!(error.agent.unwrap().target, "w2:p3");
     mock.assert_complete();
 }
 
@@ -477,7 +508,20 @@ fn zero_readiness_budget_explicitly_skips_waiting() {
         json!({"result": {}}),
     ));
     let mock = MockCli::new(steps);
-    start_and_delegate(&opts("tab"), "prompt", false, 0, 0, 0).unwrap();
+    start_and_delegate(&opts("tab"), "prompt", false, 0, 0).unwrap();
+    mock.assert_complete();
+}
+
+#[test]
+fn resume_with_zero_readiness_budget_uses_existing_pane_only() {
+    let mock = MockCli::new(vec![Step::ok(
+        &["pane", "send-text", "w2:p3", "prompt"],
+        json!({"result": {}}),
+    )]);
+    let existing = agent();
+    let resumed = resume_delegation(&existing, "prompt", false, 0).unwrap();
+    assert_eq!(resumed.pane_id, existing.pane_id);
+    assert_eq!(resumed.target, existing.target);
     mock.assert_complete();
 }
 
@@ -532,7 +576,7 @@ fn split_placements_create_then_run_in_selected_workspace() {
         ]);
         let mut options = opts(direction);
         options.focus = focus;
-        let started = start_and_delegate(&options, "prompt", true, 0, 0, 5000).unwrap();
+        let started = start_and_delegate(&options, "prompt", true, 0, 5000).unwrap();
         assert_eq!(started.target, "w2:p3");
         mock.assert_complete();
     }
@@ -559,11 +603,10 @@ fn malformed_split_response_does_not_start_or_send() {
             json!({"result": {}}),
         ),
     ]);
-    assert!(
-        start_and_delegate(&opts("right"), "prompt", true, 0, 0, 5000)
-            .unwrap_err()
-            .contains("no pane.pane_id")
-    );
+    let error = start_and_delegate(&opts("right"), "prompt", true, 0, 5000).unwrap_err();
+    assert!(error.message.contains("no pane.pane_id"));
+    assert!(error.agent.is_none());
+    assert!(!error.retry_safe);
     mock.assert_complete();
 }
 
@@ -720,10 +763,47 @@ fn already_open_worktree_gets_a_new_tab_instead_of_its_busy_root_pane() {
         ),
     ];
     steps.extend(run_in_pane_steps("w3:p2"));
+    steps.extend([
+        Step::ok(&["agent", "get", "w3:p2"], json!({"result": {"agent": {}}})),
+        Step::error(
+            &[
+                "agent",
+                "wait",
+                "w3:p2",
+                "--until",
+                "idle",
+                "--timeout",
+                "TIMEOUT<=5000",
+            ],
+            "timeout",
+        ),
+        Step::ok(&["agent", "get", "w3:p2"], json!({"result": {"agent": {}}})),
+        Step::ok(
+            &[
+                "agent",
+                "wait",
+                "w3:p2",
+                "--until",
+                "idle",
+                "--timeout",
+                "TIMEOUT<=5000",
+            ],
+            json!({"result": {}}),
+        ),
+        Step::ok(
+            &["pane", "send-text", "w3:p2", "prompt"],
+            json!({"result": {}}),
+        ),
+    ]);
     let mock = MockCli::new(steps);
-    let started = start_agent(&worktree_opts_start()).unwrap();
-    assert_eq!(started.target, "w3:p2");
-    assert_eq!(started.cwd, CHECKOUT);
+    let failure = start_and_delegate(&worktree_opts_start(), "prompt", false, 0, 5000).unwrap_err();
+    assert!(failure.retry_safe);
+    let agent = failure.agent.unwrap();
+    assert_eq!(agent.pane_id, "w3:p2");
+    assert_eq!(agent.cwd, CHECKOUT);
+    let resumed = resume_delegation(&agent, "prompt", false, 5000).unwrap();
+    assert_eq!(resumed.pane_id, "w3:p2");
+    assert_eq!(resumed.cwd, CHECKOUT);
     mock.assert_complete();
 }
 

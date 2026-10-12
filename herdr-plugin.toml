@@ -1,21 +1,15 @@
-# herdr-plugin.toml — manifest for the han.jira-worktree plugin (fork of
-# a2u/herdr-jira with an optional git worktree checkout for new agents).
+# herdr-plugin.toml — manifest for the han.jira-worktree plugin.
+# Find a Jira issue via JQL, then optionally open a git worktree or start an
+# agent. This is not a full Jira replacement.
 #
-# A keyboard-driven Jira TUI that lives in a herdr split pane (or its own tab):
-# browse configurable JQL filters (my issues, per-project, ...), search, change
-# issue status, and delegate an issue to any agent running in herdr — the agent
-# receives a prompt built from a configurable template (issue key, summary,
-# description, URL, ...).
-#
-# Configuration lives OUTSIDE the plugin checkout, in the herdr-managed config
-# dir (see `herdr plugin config-dir han.jira-worktree`):
-#   ~/.config/herdr/plugins/config/han.jira-worktree/config.toml
-# Copy config.example.toml there and fill in your Jira credentials.
+# Configuration is outside the plugin checkout. After a remote install, create
+# config.toml in `herdr plugin config-dir han.jira-worktree` using README's
+# minimal example; config.example.toml is only available from a local clone.
 
 id = "han.jira-worktree"
 name = "Jira Worktree"
-version = "0.3.1"
-description = "Jira TUI in a herdr pane: JQL filters, search, issue comments, status transitions, and one-key delegation of issues to running or newly started agents, optionally in a new or existing git worktree per herdr project."
+version = "0.3.2"
+description = "Jira TUI in a herdr pane: JQL filters, search, comments, manual status transitions, and reviewed bounded Jira-context handoff to running or newly started agents, optionally in a new or existing git worktree per herdr project."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 

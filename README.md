@@ -7,11 +7,10 @@ adding a `w` key that checks out a Jira issue into a new or existing git
 worktree per herdr project, and issue comments in the details view. Versioned
 independently of upstream (this fork starts at 0.1.0).
 
-A Jira TUI that lives in a [herdr](https://herdr.dev) pane: browse issues through
-configurable JQL filters, search, change issue status, and delegate an issue to
-any AI agent in herdr with one key — pick a running agent, or start a new one
-in a chosen directory. The agent receives a prompt built from a configurable
-template (issue key, summary, description, link, …).
+A focused Jira issue → git worktree launcher in a [herdr](https://herdr.dev)
+pane, not a replacement for Jira. Browse JQL filters, search, read issue details
+and comments, then optionally open a worktree or start an agent. Status
+transitions and agent delegation are explicit actions.
 
 ```
 ╭ Jira — My open issues (23) ─────────────────────────────────────────╮
@@ -86,8 +85,11 @@ can edit the name before `Enter`), or pick an existing worktree to reopen it.
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-**3. Agent** — just open the worktree, or start an agent from
-`[[delegate.agents]]` in it; the agent receives the Jira issue as its prompt.
+**3. Agent** — just open the worktree without fetching a handoff snapshot, or
+pick an agent from `[[delegate.agents]]`. A complete snapshot dispatches per
+the submit setting; only warnings require reviewing the bounded Jira context
+before proceeding. The final picker shows repo, branch, existing checkout vs
+new checkout, and the configured base or selected source branch `HEAD`.
 
 ```
 ╭ worktree PROJ-142 — start an agent? ──────╮
@@ -105,25 +107,26 @@ step 1, map Jira projects to repos in `[worktree.repos]`; see
 
 - **Filters** — named JQL filters from the config (`f` or `1`–`9`): my issues,
   a specific project, anything JQL can express.
-- **Search** — `/` runs a `text ~ "…"` search (template configurable), and `J`
-  runs any raw JQL you type, prefilled with the current query for quick tweaks.
+- **Search** — `/` searches across Jira by default (`text ~ "…"`); configure
+  `[search].jql` to restrict it to a project. `J` runs raw JQL, prefilled
+  with the current query for quick tweaks; `r` refreshes that same query.
 - **Epics** — epics stand out with a magenta type badge and a `▸` marker;
   `→` expands one inline to show its child issues (`parent = …`, with a
   `"Epic Link"` fallback for Server/DC), `←` collapses it.
-- **Issue details** — `Enter` opens a scrollable view with the description
-  (Cloud ADF documents are flattened to plain text).
-- **Comments** — the issue details view (`Enter`) shows the issue's comments
-  (newest first) in a pane under the description; `Tab` or a click switches
-  scrolling between the description and the comments. Comments are cached per issue;
-  press `r` in the issue list, then reopen the issue to fetch them again.
+- **Issue details** — `Enter` fetches the selected issue afresh, independently
+  of changing list rows, and opens a scrollable description (Cloud ADF is
+  flattened to plain text).
+- **Comments** — the details pane shows newest-first comments; `Tab` or click
+  selects the scrolling pane. Reopen after `r` to refresh cached comments.
 - **Status transitions** — `s` lists the transitions available for the issue
-  and applies the one you pick.
+  and applies the one you pick. Only one status change may be in flight; browsing
+  and another issue's picker remain usable. Completion refreshes the active query
+  without closing that picker.
 - **Delegate to an agent** — `d` lists agents currently running in herdr
-  (claude, codex, grok, …) with status and cwd; pick one and the issue is sent
-  as a prompt from your `[delegate].prompt` template and submitted server-side
-  (configurable). Or choose **+ start new agent…** (`n`) to pick an agent type
-  and working directory — herdr runs it via `pane run` and the same Jira
-  prompt is sent as soon as the agent is ready.
+  (claude, codex, grok, …) with status and cwd; pick one to prepare a bounded
+  authenticated Jira snapshot and review its prompt before delivery. Or choose
+  **+ start new agent…** (`n`) to pick an agent type and working directory;
+  herdr runs it via `pane run` and sends the reviewed prompt once ready.
 - **Worktree** — `w` creates or reopens a git worktree for the selected issue,
   per project like herdr's own worktree creation: pick one of herdr's projects
   (current first), then **+ new worktree** (name prefilled with the issue key)
@@ -132,7 +135,30 @@ step 1, map Jira projects to repos in `[worktree.repos]`; see
 
 Works with Jira Cloud (email + API token) and Jira Server / Data Center
 (personal access token). Cloud's newer `/rest/api/2/search/jql` endpoint is
-used when available, with automatic fallback to the classic `/rest/api/2/search`.
+used when available. Only an initial Cloud 404/405/410 switches to the classic
+`/rest/api/2/search`; other failures remain errors.
+
+Read reliability: lists, epic children and detail-view comments fetch in bounded
+pages; `[jira].max_results` is their **total cap per operation**, not a page
+size. Handoff comments use `[delegate].max_comments` independently. When more
+results exist, the UI marks the result partial rather than implying
+it is complete. Loading and errors are shown separately from a successful
+empty result; cached data retained after a failure is stale, not current.
+`r` refreshes the active search/JQL/filter; opening details fetches the issue
+again.
+Each page's latest `total` replaces earlier values, including an omitted total.
+Empty Cloud pages continue when their token advances, within a bounded request
+budget. Repeated tokens, missing required continuation metadata, inconsistent
+totals, and duplicate issue keys/comment IDs are errors, not complete results.
+Fresh issue reads require a `fields` object; a null/missing description in that
+object is valid empty content.
+
+Handoff change note: after bounded read/recovery behavior, delegation now
+prepares a reviewed, bounded issue snapshot instead of a link-only default.
+Follow-up reliability fixes pin wizard identity, isolate status writes, and
+preserve known-not-sent recovery across config reload.
+Neither handoff nor an agent response changes Jira status automatically;
+use `s` to make that decision yourself.
 
 ## Install
 
@@ -154,67 +180,64 @@ herdr plugin link ./herdr-jira-worktree
 The upstream plugin (`a2u/herdr-jira`, id `herdr-jira`) is a separate plugin; both
 can be installed side by side.
 
-## Configure
+## Configure and find your first issue
+
+Remote install does not put `config.example.toml` in your current directory.
+If you already have a config, edit it in place and preserve your custom templates;
+do not rerun the `cat >` command below, which overwrites the file. For a new
+config, create a minimal one in the actual herdr-managed directory:
 
 ```sh
-mkdir -p "$(herdr plugin config-dir han.jira-worktree)"
+config_dir="$(herdr plugin config-dir han.jira-worktree)"
+mkdir -p "$config_dir"
+cat > "$config_dir/config.toml" <<'TOML'
+[jira]
+base_url = "https://yourcompany.atlassian.net"
+auth = "basic"
+email = "you@company.com"
+api_token_cmd = "security find-generic-password -s jira-api-token -w"
+TOML
+```
+
+On **macOS Jira Cloud**, replace URL/email, create an API token at
+<https://id.atlassian.com/manage-profile/security/api-tokens>, then store it
+interactively in Keychain (the command prompts for the token; do not put it
+in command arguments or shell history):
+
+```sh
+security add-generic-password -s jira-api-token -a "$USER" -w
+```
+
+On **Linux Jira Server/Data Center**, obtain a PAT from your Jira instance.
+Install `secret-tool` and a working libsecret-compatible Secret Service
+(for example GNOME Keyring, unlocked in your session). Change the same config
+to `base_url = "https://jira.company.com"`, `auth = "bearer"` (remove `email`),
+and `api_token_cmd = "secret-tool lookup service jira-api-token"`. Store the PAT
+interactively; the command reads it from standard input, not argv:
+
+```sh
+secret-tool store --label='Jira PAT' service jira-api-token
+```
+
+For a **local clone/link** only, instead of the minimal config above you may
+copy the full example from the checkout and edit it. If a config already exists,
+edit it instead of copying over it:
+
+```sh
 cp config.example.toml "$(herdr plugin config-dir han.jira-worktree)/config.toml"
 ```
 
-Edit `config.toml`:
-
-```toml
-[jira]
-base_url = "https://yourcompany.atlassian.net"
-auth = "basic"                      # "bearer" for Server/DC PAT
-email = "you@company.com"
-api_token_cmd = "security find-generic-password -s jira-api-token -w"
-default_project = "PROJ"
-
-[[filters]]
-name = "My open issues"
-jql = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"
-
-[[filters]]
-name = "Project board"
-jql = "project = {project} AND statusCategory != Done ORDER BY updated DESC"
-
-[delegate]
-prompt = """
-You are asked to work on Jira issue {key}: {summary}
-Link: {url}
-"""
-submit = true          # submit server-side; false only pastes the text
-
-# default_cwd = "~/Work"
-placement = "tab"      # "tab" | "right" | "down"
-focus_new = false
-startup_delay_ms = 1500
-wait_ready_ms = 30000
-
-# Agents you can spawn from the delegate picker ("+ start new agent…")
-[[delegate.agents]]
-name = "claude"
-command = ["claude"]
-
-[[delegate.agents]]
-name = "codex"
-command = ["codex"]
-
-[[delegate.agents]]
-name = "grok"
-command = ["grok"]
-```
-
-For Jira Cloud, create an API token at
-<https://id.atlassian.com/manage-profile/security/api-tokens> and store it in
-the macOS Keychain so it never touches the config file:
-
-```sh
-security add-generic-password -s jira-api-token -a "$USER" -w '<TOKEN>'
-```
-
-The running pane reloads the config on `R`.
+Open **Jira: open (split)** or **Jira: open (tab)** from the herdr action palette.
+If **My open issues** is empty, that filter only shows unresolved issues assigned
+to you: press `J` for raw JQL (for example
+`project = PROJ ORDER BY updated DESC`), or `/` for global text search. You
+can also set `[jira].default_project = "PROJ"` and use the project filter, or
+define your own `[[filters]]` in config. Press `R` in the pane after edits.
+Select an issue with `Enter` to read it; `w` can open a worktree with **no
+agent**, and neither a repository mapping nor an AI agent is needed to browse.
+For `w`, choose an open herdr git project or type a repo path; optional
+`[worktree.repos]` mappings only skip that choice. New branches start from the
+selected repo's `HEAD` by default, **not** implicitly `origin/main`.
 
 ## Open the pane
 
@@ -250,53 +273,63 @@ command = "han.jira-worktree.open-jira-tab"
 | `J` | run a custom JQL query (prefilled with the current one) |
 | `s` | change issue status |
 | `d` | delegate issue to a running agent, or start a new one |
+| `D` | after a known-not-sent readiness failure: recheck and send to the retained same agent pane only (never retry an uncertain send failure) |
 | `w` | git worktree for the issue (project → new/existing worktree → optional agent) |
 | `n` | in the delegate picker: start a new agent |
 | `1`–`9` | quick pick inside any popup (agents, transitions, filters) |
 | `o` | open issue in the browser |
 | `z` | zoom the Jira pane (fullscreen toggle) |
-| `r` | refresh current filter |
-| `R` | reload config |
+| `r` | refresh current filter, search or JQL |
+| `R` | reload config (refused while a status change or handoff is dispatched) |
 | `?` | help (in issue details: the details view's keys) |
 | `Esc` | back / cancel |
 | `q` | quit |
 
 ## Delegate prompt placeholders
 
-`{key}` `{summary}` `{description}` `{url}` `{status}` `{assignee}`
-`{reporter}` `{priority}` `{type}` `{labels}`
+`{key}` `{summary}` `{description}` `{comments}` `{updated}` `{snapshot_at}`
+`{url}` `{status}` `{assignee}` `{reporter}` `{priority}` `{type}` `{labels}`
 
-The default prompt sends only the issue key, summary and link. The agent is
-expected to read the issue itself — description **and comments** — so the
-content isn't sent twice. `{url}` is a browser link that shows a sign-in page
-without a Jira login, so the agent needs its own Jira access: a Jira MCP/CLI,
-or credentials in its shell to call the REST API
-(`GET <site>/rest/api/2/issue/<KEY>?fields=summary,description,comment`).
-The Keychain `api_token_cmd` above is used only by this plugin; export the
-token in your shell profile if agents should use it too.
+The default prompt includes the issue description and comments fetched with
+the plugin's Jira credentials, alongside the issue update time and snapshot
+time. It is bounded by `max_description_chars = 6000`, `max_comments = 50`,
+and `max_comment_chars = 12000`. Jira text is **reference data**, not agent
+instructions; placeholders inside Jira content stay literal. Tokens, auth
+headers, and credential-command output are not part of the prompt. A zero
+limit omits that content with a warning; it never means unlimited.
 
-Without agent-side Jira access, add `{description}` to the template to paste the
-description into the prompt (cut after `max_description_chars`, default 6000):
+`d` and `w` keep picker headings and the prepared prompt tied to the issue
+selected at wizard entry, even if a background refresh changes the list.
+When an agent is selected, a complete snapshot dispatches without an extra
+confirmation popup, using the configured `submit` setting. Only omission,
+truncation, or partial-data warnings open a scrollable HandoffConfirm preview
+(`j`/`k`, Page Up/Down). Check its destination, context, and warnings; `Enter`
+explicitly proceeds, `Esc` cancels. An incomplete snapshot is **never
+auto-submitted**. Failed required snapshot reads abort before new agent/worktree
+side effects; unused reads for a custom template are skipped. `w` with **no
+agent** opens the worktree without a snapshot. A cancelled or reloaded
+preparation cannot send a stale prompt.
 
-```toml
-prompt = """
-You are asked to work on Jira issue {key}: {summary}
-Link: {url}
-
-Description:
-{description}
-"""
-```
-
-Comments are never included in the prompt.
+You may explicitly replace `[delegate].prompt` with a custom template. For
+example, an expert link-only template omits `{description}` and `{comments}`,
+so those reads are skipped; the agent must independently have authorized Jira
+access to obtain the context. The plugin's token does **not** authorize agents:
+do not export or paste it into their environment or prompts.
 
 With `submit = true`, `herdr agent prompt <pane-id> <text>` delivers and
-submits the prompt server-side, avoiding a race between pasted text and Enter.
-With `submit = false`, `herdr pane send-text <pane-id> <text>` only pastes the
-text. The legacy `submit_delay_ms` setting is accepted but no longer used.
-`[worktree].submit` overrides this for agents started by `w` (see below).
-Delivery errors are shown without retrying through raw input, to avoid duplicate
-prompts or typing into a startup dialog.
+submits server-side, avoiding the pasted-text/Enter race. With `submit = false`,
+`herdr pane send-text <pane-id> <text>` only pastes the prompt for review and
+manual Enter. `[worktree].submit` overrides this for `w` agents; focus settings
+affect only which pane/workspace gets focus, not submission. If a newly started
+agent does not become ready, the prompt was not sent: `D` rechecks and sends
+only to that retained same pane. A send failure can have unknown delivery:
+inspect the pane manually, **do not retry** the prompt. No raw-input fallback
+is used.
+
+`R` preserves known-not-sent recovery. `D` retains the **original prompt and
+submission/readiness policy**, even after config edits, and resumes the same
+pane without rereading Jira or creating another pane/worktree. Starting a new
+intentional handoff replaces that recovery record.
 
 ### Starting a new agent
 
@@ -326,10 +359,11 @@ otherwise the focused pane (or first available pane) in that workspace.
 `focus_new = true` uses `--focus` for either placement.
 
 Then it waits `startup_delay_ms`, polls `agent get` until detection, and uses
-`agent wait --until idle` before sending the rendered Jira prompt. Detection
+`agent wait --until idle` before sending the reviewed Jira prompt. Detection
 and idle share a single `wait_ready_ms` budget. If readiness fails, the prompt
-is **not sent** and an error is shown. `wait_ready_ms = 0` explicitly disables
-this check; it is not recommended for cold agent starts.
+is **not sent**; `D` rechecks the retained pane without starting another agent.
+`wait_ready_ms = 0` explicitly disables the check and is not recommended for
+cold agent starts.
 
 ## Worktrees (`w`)
 
@@ -350,21 +384,22 @@ goes back one step:
    (`Ctrl-U` clears) — on `Enter` it is sanitized into a valid git branch name.
    Picking an existing worktree reopens it; the issue's worktree is
    preselected when it already exists.
-3. **Agent** — **no agent** just opens the worktree workspace; or pick an agent
-   from `[[delegate.agents]]` to start it there and send the Jira prompt,
-   exactly like `d` (same `[delegate]` prompt/readiness settings; `submit`
-   follows `[delegate].submit` unless `[worktree].submit` is set). With
-   `[worktree] submit = false` the prompt is only pasted into the agent's input
-   — the toast reads "… pasted into … — review and press Enter" — so you can
-   edit it and press Enter yourself, while `d` keeps submitting.
+3. **Agent** — **no agent** just opens the worktree without reading a Jira
+   snapshot; or pick an agent from `[[delegate.agents]]` and review the same
+   bounded context as `d` before opening the worktree/starting the agent.
+   The picker displays the selected repo and branch, whether checkout exists
+   or will be created, and the configured base ref or source branch `HEAD`
+   (not an assumed `origin/main`). `submit` follows `[delegate].submit` unless
+   `[worktree].submit` is set. With `[worktree] submit = false`, the prompt
+   is pasted only; edit/review and press Enter in the agent yourself.
 
 Add a `[worktree]` table at the end of `config.toml` (after `[[delegate.agents]]`):
 
 ```toml
 [worktree]
-repo = "~/workspace/platform"          # default repo; empty/unset = pick a herdr project
+# repo = "~/workspace/platform"        # optional; unset = pick a herdr project
 branch = "{key}"                       # name prefill, e.g. "{type}/{key}-{slug}"
-base = "origin/main"                   # base ref for new branches (default: HEAD)
+# base = "origin/main"                 # optional override; default: selected repo's HEAD
 focus = true                           # focus the worktree workspace
 # path = "~/worktrees/{branch}"        # checkout path (default: herdr's worktrees dir)
 # label = "{key}"                      # workspace label
@@ -406,6 +441,33 @@ herdr worktree remove --workspace <id>   # add --force for uncommitted changes
 `{branch}`. The name is sanitized into a valid git ref; a summary with no ASCII
 letters or digits yields an empty `{slug}`, so `{key}-{slug}` falls back to
 just the key.
+
+### Manual validation checklist
+
+These are suggested observations, not completed live-Jira or user-study
+results. Record outcomes against **actual opportunities**, not total sessions:
+
+- Onboard with a real authorized Jira account on macOS Cloud or Linux
+  Server/DC: verify the secret-store command works without a token in config,
+  argv or shell history; open the pane, use `J` or `/` if My open issues is
+  empty, and open a detail with comments. Record successful first grounded
+  issue opens / actual attempts to open an accessible issue.
+- For a first grounded handoff, pick a relevant issue and observe the `d`
+  dispatch for a complete snapshot, or review a HandoffConfirm preview
+  (description, bounded comments, updated/snapshot times and warnings) when
+  context is incomplete; confirm only if appropriate. Check that the agent
+  refers to the issue's actual context. Record grounded handoffs / actual
+  handoff opportunities.
+- For paired work, try `w` with no agent, then an agent on a suitable repo;
+  verify the repo/branch/base or existing checkout displayed, compare
+  `submit = false` with `submit = true`, and observe focus override behavior.
+  Record successful paired workflows / actual paired-work opportunities.
+- On a later relevant issue, observe whether someone chooses `d`/`w` without
+  prompting; record unprompted reuses / actual later relevant opportunities.
+  Do not count absent opportunities as failures or assert a success rate from
+  this checklist. Status `s` is manual, not inferred from agent output;
+  remove unwanted worktrees explicitly with
+  `herdr worktree remove --workspace <id>` after reviewing uncommitted changes.
 
 ## License
 

@@ -3,7 +3,7 @@
 
 use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
-use crate::jira::{Comment, Issue, JiraClient, Transition};
+use crate::jira::{Comment, Issue, JiraClient, Page, Transition};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::cell::Cell;
@@ -15,6 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    HandoffConfirm,
     List,
     Detail,
     FilterPicker,
@@ -45,26 +46,32 @@ pub enum View {
 
 pub enum Resp {
     Issues {
-        title: String,
-        result: Result<Vec<Issue>, String>,
+        generation: u64,
+        result: Result<Page<Issue>, String>,
     },
     Transitions {
         key: String,
+        token: u64,
         result: Result<Vec<Transition>, String>,
     },
     Transitioned {
         key: String,
         name: String,
+        token: u64,
         result: Result<(), String>,
     },
     Agents(Result<Vec<HerdrAgent>, String>),
     Workspaces(Result<Vec<HerdrWorkspace>, String>),
+    HandoffPrepared {
+        token: u64,
+        result: Result<PromptPreview, String>,
+    },
     Delegated {
+        token: u64,
         key: String,
         label: String,
-        /// Enter was sent; false = the prompt was only pasted for review.
         submitted: bool,
-        result: Result<(), String>,
+        result: Result<HerdrAgent, herdr::DelegationFailure>,
     },
     /// `w` without an agent: `result` is the checkout path.
     WorktreeOpened {
@@ -80,16 +87,56 @@ pub enum Resp {
     },
     Children {
         epic: String,
-        result: Result<Vec<Issue>, String>,
+        token: u64,
+        result: Result<Page<Issue>, String>,
+    },
+    Detail {
+        key: String,
+        token: u64,
+        result: Result<Issue, String>,
     },
     Comments {
         key: String,
-        result: Result<Vec<Comment>, String>,
+        token: u64,
+        result: Result<Page<Comment>, String>,
     },
 }
-
 pub fn is_epic(issue: &Issue) -> bool {
     issue.issue_type.eq_ignore_ascii_case("epic")
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptPreview {
+    pub key: String,
+    pub text: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone)]
+enum HandoffDestination {
+    Existing(HerdrAgent),
+    New(StartAgentOpts),
+}
+
+#[derive(Clone)]
+struct HandoffOperation {
+    token: u64,
+    key: String,
+    destination: HandoffDestination,
+    submit: bool,
+    startup: u64,
+    wait_ready: u64,
+}
+
+struct PendingTransition {
+    token: u64,
+    key: String,
+}
+
+struct RecoveryHandoff {
+    agent: HerdrAgent,
+    operation: HandoffOperation,
+    preview: PromptPreview,
 }
 
 pub struct App {
@@ -104,14 +151,33 @@ pub struct App {
     pub should_quit: bool,
 
     pub issues: Vec<Issue>,
+    pub issues_total: Option<usize>,
+    pub issues_has_more: bool,
+    pub list_error: Option<String>,
     /// Epic expansion state: children keyed by epic key, plus which epics are
     /// currently open and which are still fetching.
     pub children: HashMap<String, Vec<Issue>>,
+    pub children_total: HashMap<String, usize>,
+    pub children_has_more: HashSet<String>,
+    pub children_err: HashMap<String, String>,
     pub expanded: HashSet<String>,
     pub loading_children: HashSet<String>,
     pub selected: usize,
     pub current_title: String,
     pub loading: bool,
+    /// The active query is independent of the currently highlighted filter.
+    active_title: String,
+    query_generation: u64,
+    request_serial: u64,
+    child_requests: HashMap<String, u64>,
+    comment_requests: HashMap<String, u64>,
+    detail_request: Option<u64>,
+    transitions_request: Option<u64>,
+    pending_transition: Option<PendingTransition>,
+    pub detail_key: Option<String>,
+    pub detail_issue: Option<Issue>,
+    pub detail_loading: bool,
+    pub detail_error: Option<String>,
     pub fatal: Option<String>, // config/auth error shown full-screen
 
     pub filter_idx: usize,
@@ -154,6 +220,14 @@ pub struct App {
     pub wt_name_input: String,
     /// Branch the agent picker opens: sanitized new name or an existing worktree's branch.
     pub wt_branch: String,
+    wizard_issue: Option<Issue>,
+    handoff: Option<HandoffOperation>,
+    pub handoff_preview: Option<PromptPreview>,
+    pub handoff_scroll: u16,
+    pub handoff_scroll_max: Cell<u16>,
+    pub handoff_loading: bool,
+    pub handoff_error: Option<String>,
+    recovery: Option<RecoveryHandoff>,
 
     pub search_input: String,
     pub jql_input: String,
@@ -172,6 +246,8 @@ pub struct App {
     pub comments: HashMap<String, Vec<Comment>>,
     pub comments_loading: HashSet<String>,
     pub comments_err: HashMap<String, String>,
+    pub comments_total: HashMap<String, usize>,
+    pub comments_has_more: HashSet<String>,
     pub comment_scroll: u16,
     /// Detail view: j/k scroll the comments pane instead of the description.
     pub detail_focus_comments: bool,
@@ -179,10 +255,27 @@ pub struct App {
     pub toast: Option<(String, bool, Instant)>, // message, is_error, shown_at
 }
 
+/// Only an explicit first-page rejection of the `parent` field can use the
+/// Server/DC "Epic Link" query. Later-page errors carry a different prefix.
+fn unsupported_parent_field(error: &str) -> bool {
+    let Some(message) = error.strip_prefix("HTTP 400:") else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    if message.contains("permission") {
+        return false;
+    }
+    ["'parent'", "\"parent\"", "`parent`"].iter().any(|field| {
+        message.contains(&format!("field {field} does not exist"))
+            || message.contains(&format!("unknown field {field}"))
+            || message.contains(&format!("field {field} is not supported"))
+    })
+}
+
 impl App {
     pub fn new(tx: Sender<Resp>) -> Self {
         let mut app = Self::unloaded(tx);
-        app.reload_config();
+        let _ = app.reload_config();
         app
     }
 
@@ -211,12 +304,30 @@ impl App {
             help_return: View::List,
             should_quit: false,
             issues: vec![],
+            issues_total: None,
+            issues_has_more: false,
+            list_error: None,
             children: HashMap::new(),
+            children_total: HashMap::new(),
+            children_has_more: HashSet::new(),
+            children_err: HashMap::new(),
             expanded: HashSet::new(),
             loading_children: HashSet::new(),
             selected: 0,
             current_title: String::new(),
             loading: false,
+            active_title: String::new(),
+            query_generation: 0,
+            request_serial: 0,
+            child_requests: HashMap::new(),
+            comment_requests: HashMap::new(),
+            detail_request: None,
+            transitions_request: None,
+            pending_transition: None,
+            detail_key: None,
+            detail_issue: None,
+            detail_loading: false,
+            detail_error: None,
             fatal: None,
             filter_idx: 0,
             picker_sel: 0,
@@ -242,6 +353,14 @@ impl App {
             wt_existing: false,
             wt_name_input: String::new(),
             wt_branch: String::new(),
+            wizard_issue: None,
+            handoff: None,
+            handoff_preview: None,
+            handoff_scroll: 0,
+            handoff_scroll_max: Cell::new(0),
+            handoff_loading: false,
+            handoff_error: None,
+            recovery: None,
             search_input: String::new(),
             jql_input: String::new(),
             last_jql: String::new(),
@@ -253,13 +372,36 @@ impl App {
             comments: HashMap::new(),
             comments_loading: HashSet::new(),
             comments_err: HashMap::new(),
+            comments_total: HashMap::new(),
+            comments_has_more: HashSet::new(),
             comment_scroll: 0,
             detail_focus_comments: false,
             toast: None,
         }
     }
 
-    pub fn reload_config(&mut self) {
+    pub fn reload_config(&mut self) -> bool {
+        if self.handoff_loading && self.handoff_preview.is_some() {
+            self.toast(
+                "handoff already dispatched — wait for delivery result before reloading",
+                true,
+            );
+            return false;
+        }
+        if self.pending_transition.is_some() {
+            self.toast(
+                "transition already dispatched — wait for result before reloading",
+                true,
+            );
+            return false;
+        }
+        self.cancel_handoff();
+        if self.view == View::List {
+            self.return_to_list();
+        } else {
+            self.wizard_issue = None;
+        }
+        self.invalidate_requests();
         match Config::load() {
             Ok(cfg) => match JiraClient::new(&cfg) {
                 Ok(client) => {
@@ -273,11 +415,39 @@ impl App {
                 }
                 Err(e) => {
                     self.cfg = cfg;
-                    self.fatal = Some(e);
+                    self.client = None;
+                    self.fatal = Some(format!(
+                        "{e}\n\nEdit {}: set [jira].base_url and api_token (or api_token_cmd); \
+                         for basic auth also set email. No checkout-local config is required.",
+                        crate::config::config_path().display()
+                    ));
                 }
             },
-            Err(e) => self.fatal = Some(e),
+            Err(e) => {
+                self.client = None;
+                self.fatal = Some(e);
+            }
         }
+        true
+    }
+
+    fn next_token(&mut self) -> u64 {
+        self.request_serial = self.request_serial.wrapping_add(1);
+        self.request_serial
+    }
+
+    fn invalidate_requests(&mut self) {
+        self.query_generation = self.query_generation.wrapping_add(1);
+        self.next_token();
+        self.child_requests.clear();
+        self.comment_requests.clear();
+        self.detail_request = None;
+        self.transitions_request = None;
+        self.transitions_loading = false;
+        self.loading = false;
+        self.loading_children.clear();
+        self.comments_loading.clear();
+        self.detail_loading = false;
     }
 
     /// Rows currently on screen: top-level issues, with the children of every
@@ -296,7 +466,77 @@ impl App {
     }
 
     pub fn selected_issue(&self) -> Option<&Issue> {
-        self.visible().get(self.selected).map(|(i, _)| *i)
+        if self.detail_key.is_some()
+            && (self.view == View::Detail
+                || matches!(self.view, View::Help | View::HandoffConfirm)
+                    && self.help_return == View::Detail)
+        {
+            let key = self.detail_key.as_deref()?;
+            return self
+                .detail_issue
+                .as_ref()
+                .filter(|issue| issue.key == key)
+                .or_else(|| {
+                    self.visible()
+                        .into_iter()
+                        .find(|(issue, _)| issue.key == key)
+                        .map(|(issue, _)| issue)
+                });
+        }
+        self.visible().get(self.selected).map(|(issue, _)| *issue)
+    }
+
+    pub(crate) fn wizard_issue_key(&self) -> Option<&str> {
+        self.wizard_issue.as_ref().map(|issue| issue.key.as_str())
+    }
+
+    pub(crate) fn handoff_recovery_agent(&self) -> Option<&HerdrAgent> {
+        self.recovery.as_ref().map(|recovery| &recovery.agent)
+    }
+
+    /// A real exit to the list, never the temporary list during handoff prep.
+    fn return_to_list(&mut self) {
+        self.view = View::List;
+        self.help_return = View::List;
+        self.wizard_issue = None;
+        self.detail_key = None;
+        self.detail_issue = None;
+        self.detail_error = None;
+        self.detail_request = None;
+        self.detail_loading = false;
+        self.comment_requests.clear();
+        self.comments_loading.clear();
+        self.comments_err.clear();
+        self.transitions_request = None;
+        self.transitions_loading = false;
+        self.transitions.clear();
+        self.transitions_for.clear();
+        self.agents_loading = false;
+        self.workspaces_loading = false;
+        self.wt_projects_loading = false;
+        self.wt_worktrees_loading = false;
+    }
+
+    fn restore_handoff_origin(&mut self) {
+        if self.help_return == View::Detail {
+            self.wizard_issue = None;
+            self.view = View::Detail;
+        } else {
+            self.return_to_list();
+        }
+    }
+
+    fn selected_key(&self) -> Option<String> {
+        self.visible()
+            .get(self.selected)
+            .map(|(issue, _)| issue.key.clone())
+    }
+
+    fn preserve_selection(&mut self, key: Option<&str>) {
+        let rows = self.visible();
+        self.selected = key
+            .and_then(|key| rows.iter().position(|(issue, _)| issue.key == key))
+            .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
     }
 
     fn toast(&mut self, msg: impl Into<String>, is_error: bool) {
@@ -306,16 +546,30 @@ impl App {
     // ---- background requests ----
 
     fn spawn_search(&mut self, jql: String, title: String) {
+        self.last_jql = jql.clone();
+        self.active_title = title.clone();
+        self.current_title = title;
+        self.query_generation = self.query_generation.wrapping_add(1);
+        self.child_requests.clear();
+        self.loading_children.clear();
+        let generation = self.query_generation;
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.last_jql = jql.clone();
         self.loading = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let result = client.search(&jql);
-            let _ = tx.send(Resp::Issues { title, result });
+            let _ = tx.send(Resp::Issues { generation, result });
         });
+    }
+
+    fn refresh_query(&mut self) {
+        if !self.last_jql.is_empty() {
+            self.spawn_search(self.last_jql.clone(), self.active_title.clone());
+        } else {
+            self.load_filter(self.filter_idx);
+        }
     }
 
     pub fn load_filter(&mut self, idx: usize) {
@@ -343,6 +597,8 @@ impl App {
             return;
         };
         let key = issue.key.clone();
+        let token = self.next_token();
+        self.transitions_request = Some(token);
         self.transitions_for = key.clone();
         self.transitions.clear();
         self.transitions_loading = true;
@@ -351,15 +607,24 @@ impl App {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let result = client.transitions(&key);
-            let _ = tx.send(Resp::Transitions { key, result });
+            let _ = tx.send(Resp::Transitions { key, token, result });
         });
     }
 
-    fn apply_transition(&mut self, t: Transition) {
+    fn apply_transition(&mut self, t: Transition) -> bool {
+        if self.pending_transition.is_some() {
+            self.toast("transition already applying — wait for result", true);
+            return false;
+        }
         let Some(client) = self.client.clone() else {
-            return;
+            return false;
         };
         let key = self.transitions_for.clone();
+        let token = self.next_token();
+        self.pending_transition = Some(PendingTransition {
+            token,
+            key: key.clone(),
+        });
         let tx = self.tx.clone();
         self.toast(format!("{key}: applying \"{}\"…", t.name), false);
         std::thread::spawn(move || {
@@ -367,27 +632,39 @@ impl App {
             let _ = tx.send(Resp::Transitioned {
                 key,
                 name: t.to_status,
+                token,
                 result,
             });
         });
+        true
     }
 
-    /// Fetch comments for `key` unless cached, failed, or already in flight.
+    /// Explicit detail entry/refresh always fetches; cached values remain visible.
     fn fetch_comments(&mut self, key: String) {
-        if self.comments.contains_key(&key)
-            || self.comments_err.contains_key(&key)
-            || self.comments_loading.contains(&key)
-        {
-            return;
-        }
         let Some(client) = self.client.clone() else {
             return;
         };
+        let token = self.next_token();
+        self.comment_requests.insert(key.clone(), token);
         self.comments_loading.insert(key.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let result = client.comments(&key);
-            let _ = tx.send(Resp::Comments { key, result });
+            let _ = tx.send(Resp::Comments { key, token, result });
+        });
+    }
+
+    fn fetch_detail(&mut self, key: String) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let token = self.next_token();
+        self.detail_request = Some(token);
+        self.detail_loading = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = client.issue(&key);
+            let _ = tx.send(Resp::Detail { key, token, result });
         });
     }
 
@@ -403,25 +680,34 @@ impl App {
         if self.expanded.contains(&key) {
             return;
         }
+        self.expanded.insert(key.clone());
         if self.children.contains_key(&key) {
-            self.expanded.insert(key);
             return;
         }
         let Some(client) = self.client.clone() else {
             return;
         };
-        if !self.loading_children.insert(key.clone()) {
-            return; // fetch already in flight
-        }
-        self.toast(format!("loading issues in {key}…"), false);
+        let token = self.next_token();
+        self.child_requests.insert(key.clone(), token);
+        self.loading_children.insert(key.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            // Jira Cloud links children via `parent`; classic Server/DC epics
-            // use the "Epic Link" field. Try both.
-            let result = client
-                .search(&format!("parent = {key} ORDER BY created ASC"))
-                .or_else(|_| client.search(&format!("\"Epic Link\" = {key} ORDER BY created ASC")));
-            let _ = tx.send(Resp::Children { epic: key, result });
+            // Cloud uses `parent`; Server/DC may require the classic "Epic Link" field.
+            let result = client.search(&format!("parent = {key} ORDER BY created ASC"));
+            let result = if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| unsupported_parent_field(error))
+            {
+                client.search(&format!("\"Epic Link\" = {key} ORDER BY created ASC"))
+            } else {
+                result
+            };
+            let _ = tx.send(Resp::Children {
+                epic: key,
+                token,
+                result,
+            });
         });
     }
 
@@ -449,6 +735,8 @@ impl App {
                 None => return,
             }
         };
+        self.child_requests.remove(&epic_key);
+        self.loading_children.remove(&epic_key);
         self.expanded.remove(&epic_key);
         // Land the selection on the epic row itself.
         if let Some(idx) = self.visible().iter().position(|(i, _)| i.key == epic_key) {
@@ -457,16 +745,21 @@ impl App {
     }
 
     fn request_agents(&mut self) {
-        if self.selected_issue().is_none() {
+        if self.handoff_loading || self.handoff.is_some() {
             return;
         }
+        let Some(issue) = self.selected_issue().cloned() else {
+            return;
+        };
+        self.wizard_issue = Some(issue);
+        self.help_return = self.view;
         self.agents.clear();
         self.agents_loading = true;
         self.picker_sel = 0;
         self.pending_spawn = None;
         self.view = View::AgentPicker;
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
+        spawn_herdr(move || {
             let _ = tx.send(Resp::Agents(herdr::list_agents()));
         });
     }
@@ -536,30 +829,16 @@ impl App {
     }
 
     fn delegate_to(&mut self, agent: HerdrAgent) {
-        let Some(issue) = self.selected_issue() else {
-            return;
-        };
-        let text = build_prompt(&self.cfg, issue);
-        let key = issue.key.clone();
-        let submit = self.cfg.delegate.submit;
-        let delay = self.cfg.delegate.submit_delay_ms;
-        let tx = self.tx.clone();
-        self.toast(format!("sending {key} to {}…", agent.label), false);
-        std::thread::spawn(move || {
-            let result = herdr::send_to_agent(&agent, &text, submit, delay);
-            let _ = tx.send(Resp::Delegated {
-                key,
-                label: agent.label,
-                submitted: submit,
-                result,
-            });
-        });
+        self.prepare_handoff(
+            HandoffDestination::Existing(agent),
+            self.cfg.delegate.submit,
+        );
     }
 
     /// Spawn a fresh agent in the chosen workspace + cwd, wait until ready,
     /// send the Jira prompt.
     fn start_new_and_delegate(&mut self, cwd_raw: String) {
-        let Some(issue) = self.selected_issue() else {
+        let Some(issue) = self.wizard_issue.as_ref() else {
             return;
         };
         let Some(spawn) = self.pending_spawn.clone() else {
@@ -584,16 +863,10 @@ impl App {
             return;
         }
 
-        let text = build_prompt(&self.cfg, issue);
         let key = issue.key.clone();
-        let submit = self.cfg.delegate.submit;
-        let delay = self.cfg.delegate.submit_delay_ms;
-        let startup = self.cfg.delegate.startup_delay_ms;
-        let wait_ready = self.cfg.delegate.wait_ready_ms;
         let placement = self.cfg.delegate.placement.clone();
         let focus = self.cfg.delegate.focus_new;
         let name = unique_agent_name(&key, &spawn.name);
-        let agent_label = spawn.name.clone();
         let ws_label = ws.label.clone();
         let opts = StartAgentOpts {
             name,
@@ -610,24 +883,123 @@ impl App {
         } else {
             format!("split {placement} in {ws_label}")
         };
-        let tx = self.tx.clone();
         self.toast(
             format!(
-                "starting {agent_label} for {key} ({place_hint}, {})…",
+                "preparing {key} for {ws_label} ({place_hint}, {})…",
                 short_home(&cwd)
             ),
             false,
         );
+        self.prepare_handoff(HandoffDestination::New(opts), self.cfg.delegate.submit);
+    }
+
+    fn cancel_handoff(&mut self) {
+        self.handoff = None;
+        self.handoff_preview = None;
+        self.handoff_loading = false;
+        self.next_token();
+    }
+
+    fn prepare_handoff(&mut self, destination: HandoffDestination, submit: bool) {
+        if self.handoff.is_some() {
+            return;
+        }
+        let Some(key) = self.wizard_issue.as_ref().map(|issue| issue.key.clone()) else {
+            return;
+        };
+        let token = self.next_token();
+        self.handoff_error = None;
+        self.recovery = None;
+        self.handoff_preview = None;
+        self.handoff_scroll = 0;
+        self.handoff_loading = true;
+        let op = HandoffOperation {
+            token,
+            key: key.clone(),
+            destination,
+            submit,
+            startup: self.cfg.delegate.startup_delay_ms,
+            wait_ready: self.cfg.delegate.wait_ready_ms,
+        };
+        self.handoff = Some(op);
+        let cfg = self.cfg.clone();
+        let client = self.client.clone();
+        let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result =
-                herdr::start_and_delegate(&opts, &text, submit, delay, startup, wait_ready)
-                    .map(|a| a.label);
-            let label = match &result {
-                Ok(l) => l.clone(),
-                Err(_) => agent_label,
+            let result = prepare_prompt(&cfg, client.as_deref(), &key);
+            let _ = tx.send(Resp::HandoffPrepared { token, result });
+        });
+    }
+
+    fn dispatch_handoff(&mut self) {
+        let Some(op) = self.handoff.as_ref().cloned() else {
+            return;
+        };
+        let Some(preview) = self.handoff_preview.as_ref() else {
+            return;
+        };
+        let text = preview.text.clone();
+        let key = op.key.clone();
+        let label = match &op.destination {
+            HandoffDestination::Existing(a) => a.label.clone(),
+            HandoffDestination::New(opts) => opts.name.clone(),
+        };
+        self.view = self.help_return;
+        self.handoff_loading = true;
+        self.toast(format!("sending {key} to {label}…"), false);
+        let tx = self.tx.clone();
+        spawn_herdr(move || {
+            let result = match &op.destination {
+                HandoffDestination::Existing(agent) => {
+                    herdr::send_to_agent(agent, &text, op.submit)
+                        .map(|_| agent.clone())
+                        .map_err(|message| herdr::DelegationFailure {
+                            message,
+                            agent: Some(agent.clone()),
+                            retry_safe: false,
+                        })
+                }
+                HandoffDestination::New(opts) => {
+                    herdr::start_and_delegate(opts, &text, op.submit, op.startup, op.wait_ready)
+                }
             };
-            let result = result.map(|_| ());
             let _ = tx.send(Resp::Delegated {
+                token: op.token,
+                key,
+                label,
+                submitted: op.submit,
+                result,
+            });
+        });
+    }
+
+    fn retry_handoff(&mut self) {
+        if self.handoff_loading || self.handoff.is_some() {
+            return;
+        }
+        let Some(RecoveryHandoff {
+            agent,
+            operation,
+            preview,
+        }) = self.recovery.take()
+        else {
+            return;
+        };
+        let text = preview.text.clone();
+        let key = operation.key.clone();
+        let label = agent.label.clone();
+        let submit = operation.submit;
+        let wait_ready = operation.wait_ready;
+        let token = self.next_token();
+        self.handoff_preview = Some(preview);
+        self.handoff_loading = true;
+        self.handoff_error = None;
+        self.handoff = Some(HandoffOperation { token, ..operation });
+        let tx = self.tx.clone();
+        spawn_herdr(move || {
+            let result = herdr::resume_delegation(&agent, &text, submit, wait_ready);
+            let _ = tx.send(Resp::Delegated {
+                token,
                 key,
                 label,
                 submitted: submit,
@@ -636,14 +1008,46 @@ impl App {
         });
     }
 
+    fn keys_handoff_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.dispatch_handoff(),
+            KeyCode::Esc => {
+                self.cancel_handoff();
+                self.restore_handoff_origin();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.handoff_scroll = self
+                    .handoff_scroll
+                    .saturating_add(1)
+                    .min(self.handoff_scroll_max.get())
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.handoff_scroll = self.handoff_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => {
+                self.handoff_scroll = self
+                    .handoff_scroll
+                    .saturating_add(10)
+                    .min(self.handoff_scroll_max.get())
+            }
+            KeyCode::PageUp => self.handoff_scroll = self.handoff_scroll.saturating_sub(10),
+            _ => {}
+        }
+    }
+
     // ---- `w`: git worktree for the selected issue ----
 
     /// Resolve the repo from `[worktree]` (per project key, then the default)
     /// or let the user pick a herdr project; then show the repo's worktrees.
     fn open_worktree(&mut self) {
-        let Some(issue) = self.selected_issue() else {
+        if self.handoff_loading || self.handoff.is_some() {
+            return;
+        }
+        self.wizard_issue = self.selected_issue().cloned();
+        let Some(issue) = self.wizard_issue.as_ref() else {
             return;
         };
+        self.help_return = self.view;
         let wcfg = &self.cfg.worktree;
         let default_branch = render_branch_name(&wcfg.branch, issue);
         let configured = wcfg
@@ -665,7 +1069,10 @@ impl App {
                 let name = dir_name(&repo);
                 self.open_worktree_list(repo, name);
             }
-            Err(e) => self.toast(format!("worktree repo: {e}"), true),
+            Err(e) => {
+                self.wizard_issue = None;
+                self.toast(format!("worktree repo: {e}"), true);
+            }
         }
     }
 
@@ -811,17 +1218,10 @@ impl App {
             self.toast(format!("{}: empty command", spawn.name), true);
             return;
         }
-        let Some(issue) = self.selected_issue() else {
+        let Some(key) = self.wizard_issue.as_ref().map(|issue| issue.key.clone()) else {
             return;
         };
-        let text = build_prompt(&self.cfg, issue);
-        let key = issue.key.clone();
         let submit = self.cfg.worktree.submit.unwrap_or(self.cfg.delegate.submit);
-        let delay = self.cfg.delegate.submit_delay_ms;
-        let startup = self.cfg.delegate.startup_delay_ms;
-        let wait_ready = self.cfg.delegate.wait_ready_ms;
-        let agent_label = spawn.name.clone();
-        let hint = format!("worktree {} of {}", wt.branch, short_home(&self.wt_repo));
         let opts = StartAgentOpts {
             name: unique_agent_name(&key, &spawn.name),
             cwd: self.wt_repo.clone(),
@@ -832,24 +1232,7 @@ impl App {
             tab_label: key.clone(),
             worktree: Some(wt),
         };
-        let tx = self.tx.clone();
-        self.toast(format!("starting {agent_label} for {key} ({hint})…"), false);
-        std::thread::spawn(move || {
-            let result =
-                herdr::start_and_delegate(&opts, &text, submit, delay, startup, wait_ready)
-                    .map(|a| a.label);
-            let label = match &result {
-                Ok(l) => l.clone(),
-                Err(_) => agent_label,
-            };
-            let result = result.map(|_| ());
-            let _ = tx.send(Resp::Delegated {
-                key,
-                label,
-                submitted: submit,
-                result,
-            });
-        });
+        self.prepare_handoff(HandoffDestination::New(opts), submit);
     }
 
     fn zoom_toggle(&mut self) {
@@ -875,49 +1258,87 @@ impl App {
 
     pub fn on_resp(&mut self, resp: Resp) {
         match resp {
-            Resp::Issues { title, result } => {
-                self.loading = false;
-                match result {
-                    Ok(issues) => {
-                        self.current_title = title;
-                        self.issues = issues;
-                        self.children.clear();
-                        self.expanded.clear();
-                        self.loading_children.clear();
-                        self.selected = self.selected.min(self.issues.len().saturating_sub(1));
-                    }
-                    Err(e) => self.toast(format!("Jira: {e}"), true),
-                }
-            }
-            Resp::Transitions { key, result } => {
-                if key != self.transitions_for {
+            Resp::Issues { generation, result } => {
+                if generation != self.query_generation {
                     return;
                 }
+                self.loading = false;
+                match result {
+                    Ok(page) => {
+                        let selected_key = self.selected_key();
+                        self.issues = page.items;
+                        self.issues_total = page.total;
+                        self.issues_has_more = page.has_more;
+                        self.list_error = None;
+                        self.children.clear();
+                        self.children_total.clear();
+                        self.children_has_more.clear();
+                        self.children_err.clear();
+                        self.expanded.clear();
+                        self.child_requests.clear();
+                        self.loading_children.clear();
+                        self.preserve_selection(selected_key.as_deref());
+                    }
+                    Err(e) => {
+                        self.list_error = Some(e.clone());
+                        self.toast(format!("Jira: {e}"), true);
+                    }
+                }
+            }
+            Resp::Transitions { key, token, result } => {
+                if key != self.transitions_for || self.transitions_request != Some(token) {
+                    return;
+                }
+                self.transitions_request = None;
                 self.transitions_loading = false;
                 match result {
                     Ok(ts) => self.transitions = ts,
                     Err(e) => {
-                        self.view = View::List;
+                        if self.view == View::TransitionPicker {
+                            self.return_to_list();
+                        }
                         self.toast(format!("{key}: transitions: {e}"), true);
                     }
                 }
             }
-            Resp::Transitioned { key, name, result } => match result {
-                Ok(()) => {
-                    self.comments.remove(&key);
-                    self.comments_err.remove(&key);
-                    self.toast(format!("{key} → {name}"), false);
-                    self.load_filter(self.filter_idx);
+            Resp::Transitioned {
+                key,
+                name,
+                token,
+                result,
+            } => {
+                if !self
+                    .pending_transition
+                    .as_ref()
+                    .is_some_and(|pending| pending.token == token && pending.key == key)
+                {
+                    return;
                 }
-                Err(e) => self.toast(format!("{key}: {e}"), true),
-            },
+                self.pending_transition = None;
+                match result {
+                    Ok(()) => {
+                        self.toast(format!("{key} → {name}"), false);
+                        self.refresh_query();
+                        if self.detail_key.as_deref() == Some(key.as_str())
+                            && self.view == View::Detail
+                        {
+                            self.fetch_detail(key.clone());
+                            self.fetch_comments(key);
+                        }
+                    }
+                    Err(e) => self.toast(format!("{key}: {e}"), true),
+                }
+            }
             Resp::Agents(result) => {
+                if self.view != View::AgentPicker || !self.agents_loading {
+                    return;
+                }
                 self.agents_loading = false;
                 match result {
                     Ok(agents) => {
                         self.agents = agents;
                         if self.agents.is_empty() && !self.can_start_new_agent() {
-                            self.view = View::List;
+                            self.return_to_list();
                             self.toast(
                                 "no running agents and no [[delegate.agents]] to start",
                                 true,
@@ -933,7 +1354,7 @@ impl App {
                                 true,
                             );
                         } else {
-                            self.view = View::List;
+                            self.return_to_list();
                             self.toast(format!("agents: {e}"), true);
                         }
                     }
@@ -965,25 +1386,85 @@ impl App {
                     }
                 }
             }
+            Resp::HandoffPrepared { token, result } => {
+                if self.handoff.as_ref().map_or(true, |op| op.token != token) {
+                    return;
+                }
+                self.handoff_loading = false;
+                match result {
+                    Err(e) => {
+                        self.handoff = None;
+                        self.restore_handoff_origin();
+                        self.handoff_error = Some(format!(
+                            "Jira snapshot read failed: {e}; no agent or worktree started"
+                        ));
+                    }
+                    Ok(preview) => {
+                        let incomplete = !preview.warnings.is_empty();
+                        self.handoff_preview = Some(preview);
+                        if incomplete {
+                            self.handoff_scroll = 0;
+                            self.view = View::HandoffConfirm;
+                        } else {
+                            self.dispatch_handoff();
+                        }
+                    }
+                }
+            }
             Resp::Delegated {
+                token,
                 key,
                 label,
                 submitted,
                 result,
-            } => match result {
-                Ok(()) if submitted => {
-                    self.toast(format!("{key} delegated to {label}"), false);
-                    herdr::notify(&format!("Jira {key} delegated to {label}"));
+            } => {
+                if self.handoff.as_ref().map_or(true, |op| op.token != token) {
+                    return;
                 }
-                Ok(()) => {
-                    self.toast(
-                        format!("{key} pasted into {label} — review and press Enter"),
-                        false,
-                    );
-                    herdr::notify(&format!("Jira {key} pasted into {label}"));
+                let op = self.handoff.take().unwrap();
+                self.handoff_loading = false;
+                self.wizard_issue = None;
+                match result {
+                    Ok(_) if submitted => {
+                        self.handoff_preview = None;
+                        self.toast(format!("{key} delegated to {label}"), false);
+                        herdr::notify(&format!("Jira {key} delegated to {label}"));
+                    }
+                    Ok(_) => {
+                        self.handoff_preview = None;
+                        self.toast(
+                            format!("{key} pasted into {label} — review and press Enter"),
+                            false,
+                        );
+                        herdr::notify(&format!("Jira {key} pasted into {label}"));
+                    }
+                    Err(failure) => {
+                        let known_pane = failure.agent.is_some();
+                        self.recovery = match (
+                            failure.retry_safe,
+                            failure.agent,
+                            self.handoff_preview.take(),
+                        ) {
+                            (true, Some(agent), Some(preview)) => Some(RecoveryHandoff {
+                                agent,
+                                operation: op,
+                                preview,
+                            }),
+                            _ => None,
+                        };
+                        let suffix = if self.recovery.is_some() {
+                            "known not sent — press D to recheck the same pane"
+                        } else if known_pane {
+                            "delivery unknown — inspect pane; do not retry"
+                        } else {
+                            "not sent"
+                        };
+                        let msg = format!("delegate {key}: {}; {suffix}", failure.message);
+                        self.handoff_error = Some(msg.clone());
+                        self.toast(msg, true);
+                    }
                 }
-                Err(e) => self.toast(format!("delegate {key}: {e}"), true),
-            },
+            }
             Resp::WorktreeOpened { branch, result } => match result {
                 Ok(path) => self.toast(
                     format!("worktree {branch} ready: {}", short_home(&path)),
@@ -993,25 +1474,81 @@ impl App {
             },
             Resp::Projects(result) => self.on_projects(result),
             Resp::RepoWorktrees { repo, result } => self.on_repo_worktrees(repo, result),
-            Resp::Children { epic, result } => {
+            Resp::Children {
+                epic,
+                token,
+                result,
+            } => {
+                if self.child_requests.get(&epic) != Some(&token) || !self.expanded.contains(&epic)
+                {
+                    return;
+                }
+                self.child_requests.remove(&epic);
                 self.loading_children.remove(&epic);
                 match result {
-                    Ok(kids) if kids.is_empty() => {
-                        self.toast(format!("{epic}: no issues in this epic"), false)
+                    Ok(page) => {
+                        let selected_key = self.selected_key();
+                        if let Some(total) = page.total {
+                            self.children_total.insert(epic.clone(), total);
+                        } else {
+                            self.children_total.remove(&epic);
+                        }
+                        if page.has_more {
+                            self.children_has_more.insert(epic.clone());
+                        } else {
+                            self.children_has_more.remove(&epic);
+                        }
+                        self.children_err.remove(&epic);
+                        self.children.insert(epic, page.items);
+                        self.preserve_selection(selected_key.as_deref());
                     }
-                    Ok(kids) => {
-                        self.children.insert(epic.clone(), kids);
-                        self.expanded.insert(epic);
+                    Err(e) => {
+                        self.children_err.insert(epic.clone(), e.clone());
+                        self.toast(format!("{epic}: children: {e}"), true);
                     }
-                    Err(e) => self.toast(format!("{epic}: children: {e}"), true),
                 }
             }
-            Resp::Comments { key, result } => {
+            Resp::Detail { key, token, result } => {
+                if self.detail_key.as_deref() != Some(key.as_str())
+                    || self.detail_request != Some(token)
+                {
+                    return;
+                }
+                self.detail_request = None;
+                self.detail_loading = false;
+                match result {
+                    Ok(issue) if issue.key == key => {
+                        self.detail_issue = Some(issue);
+                        self.detail_error = None;
+                    }
+                    Ok(_) => {
+                        self.detail_error = Some(format!("{key}: Jira returned a different issue"))
+                    }
+                    Err(e) => self.detail_error = Some(e),
+                }
+            }
+            Resp::Comments { key, token, result } => {
+                if self.comment_requests.get(&key) != Some(&token)
+                    || self.detail_key.as_deref() != Some(key.as_str())
+                {
+                    return;
+                }
+                self.comment_requests.remove(&key);
                 self.comments_loading.remove(&key);
                 match result {
-                    Ok(list) => {
+                    Ok(page) => {
                         self.comments_err.remove(&key);
-                        self.comments.insert(key, list);
+                        if let Some(total) = page.total {
+                            self.comments_total.insert(key.clone(), total);
+                        } else {
+                            self.comments_total.remove(&key);
+                        }
+                        if page.has_more {
+                            self.comments_has_more.insert(key.clone());
+                        } else {
+                            self.comments_has_more.remove(&key);
+                        }
+                        self.comments.insert(key, page.items);
                     }
                     Err(e) => {
                         self.comments_err.insert(key, e);
@@ -1031,12 +1568,25 @@ impl App {
         if self.fatal.is_some() {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-                KeyCode::Char('R') | KeyCode::Char('r') => self.reload_config(),
+                KeyCode::Char('R') | KeyCode::Char('r') => {
+                    let _ = self.reload_config();
+                }
                 _ => {}
             }
             return;
         }
+        if key.code == KeyCode::Esc && self.handoff.is_some() && self.handoff_preview.is_none() {
+            self.cancel_handoff();
+            self.restore_handoff_origin();
+            self.toast("Jira handoff preparation cancelled", false);
+            return;
+        }
+        if key.code == KeyCode::Char('D') && matches!(self.view, View::List | View::Detail) {
+            self.retry_handoff();
+            return;
+        }
         match self.view {
+            View::HandoffConfirm => self.keys_handoff_confirm(key),
             View::List => self.keys_list(key),
             View::Detail => self.keys_detail(key),
             View::FilterPicker => self.keys_filter_picker(key),
@@ -1131,11 +1681,18 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.expand_epic(),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_epic(),
             KeyCode::Enter => {
-                if let Some(key) = self.selected_issue().map(|i| i.key.clone()) {
+                if let Some(issue) = self.selected_issue().cloned() {
+                    let key = issue.key.clone();
+                    self.comment_requests.clear();
+                    self.comments_loading.clear();
+                    self.detail_key = Some(key.clone());
+                    self.detail_issue = Some(issue);
+                    self.detail_error = None;
                     self.detail_scroll = 0;
                     self.detail_focus_comments = false;
                     self.view = View::Detail;
                     self.comment_scroll = 0;
+                    self.fetch_detail(key.clone());
                     self.fetch_comments(key);
                 }
             }
@@ -1157,14 +1714,11 @@ impl App {
                 self.jql_input = self.last_jql.clone();
                 self.view = View::JqlInput;
             }
-            KeyCode::Char('r') => {
-                self.comments.clear();
-                self.comments_err.clear();
-                self.load_filter(self.filter_idx);
-            }
+            KeyCode::Char('r') => self.refresh_query(),
             KeyCode::Char('R') => {
-                self.reload_config();
-                self.toast("config reloaded", false);
+                if self.reload_config() && self.fatal.is_none() {
+                    self.toast("config reloaded", false);
+                }
             }
             KeyCode::Char('s') => self.request_transitions(),
             KeyCode::Char('d') => self.request_agents(),
@@ -1178,7 +1732,14 @@ impl App {
 
     fn keys_detail(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Esc | KeyCode::Char('q') => self.return_to_list(),
+            KeyCode::Char('r') => {
+                self.refresh_query();
+                if let Some(key) = self.detail_key.clone().or_else(|| self.selected_key()) {
+                    self.fetch_detail(key.clone());
+                    self.fetch_comments(key);
+                }
+            }
             KeyCode::Tab => self.detail_focus_comments = !self.detail_focus_comments,
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_focused(-1),
@@ -1203,7 +1764,7 @@ impl App {
 
     /// View drawn under popups: `Help` shows over the view it came from.
     pub fn base_view(&self) -> View {
-        if self.view == View::Help {
+        if matches!(self.view, View::Help | View::HandoffConfirm) {
             self.help_return
         } else {
             self.view
@@ -1261,13 +1822,14 @@ impl App {
     fn keys_transition_picker(&mut self, key: KeyEvent) {
         if let Some(idx) = Self::picker_number(&key, self.transitions.len()) {
             if let Some(t) = self.transitions.get(idx).cloned() {
-                self.view = View::List;
-                self.apply_transition(t);
+                if self.apply_transition(t) {
+                    self.return_to_list();
+                }
             }
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Esc | KeyCode::Char('q') => self.return_to_list(),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.picker_sel = Self::move_sel(self.transitions.len(), self.picker_sel, 1)
             }
@@ -1276,8 +1838,9 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(t) = self.transitions.get(self.picker_sel).cloned() {
-                    self.view = View::List;
-                    self.apply_transition(t);
+                    if self.apply_transition(t) {
+                        self.return_to_list();
+                    }
                 }
             }
             _ => {}
@@ -1292,8 +1855,10 @@ impl App {
         }
         let agent_idx = row.saturating_sub(offset);
         if let Some(agent) = self.agents.get(agent_idx).cloned() {
-            self.view = View::List;
             self.delegate_to(agent);
+            if self.handoff.is_some() {
+                self.view = View::List;
+            }
         }
     }
 
@@ -1304,7 +1869,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Esc | KeyCode::Char('q') => self.return_to_list(),
             KeyCode::Char('n') => self.open_new_agent_type_picker(),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.picker_sel = Self::move_sel(len, self.picker_sel, 1)
@@ -1416,8 +1981,10 @@ impl App {
             return;
         }
         let cwd = self.cwd_choices[row].clone();
-        self.view = View::List;
         self.start_new_and_delegate(cwd);
+        if self.handoff.is_some() {
+            self.view = View::List;
+        }
     }
 
     fn keys_cwd_input(&mut self, key: KeyEvent) {
@@ -1431,8 +1998,10 @@ impl App {
                     self.toast("cwd is empty", true);
                     return;
                 }
-                self.view = View::List;
                 self.start_new_and_delegate(cwd);
+                if self.handoff.is_some() {
+                    self.view = View::List;
+                }
             }
             KeyCode::Backspace => {
                 self.cwd_input.pop();
@@ -1453,7 +2022,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Esc | KeyCode::Char('q') => self.return_to_list(),
             KeyCode::Char('j') | KeyCode::Down => {
                 self.picker_sel = Self::move_sel(n, self.picker_sel, 1)
             }
@@ -1514,7 +2083,7 @@ impl App {
                 if self.wt_project_asked {
                     self.return_to_project_picker();
                 } else {
-                    self.view = View::List;
+                    self.return_to_list();
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1603,14 +2172,21 @@ impl App {
                 None => return,
             },
         };
-        let Some(issue) = self.selected_issue() else {
+        let Some(issue) = self.wizard_issue.as_ref() else {
             return;
         };
         let opts = worktree_opts(&self.cfg, issue, &self.wt_branch);
-        self.view = View::List;
         match spawn {
-            None => self.open_worktree_only(opts),
-            Some(spawn) => self.start_worktree_agent(spawn, opts),
+            None => {
+                self.return_to_list();
+                self.open_worktree_only(opts);
+            }
+            Some(spawn) => {
+                self.start_worktree_agent(spawn, opts);
+                if self.handoff.is_some() {
+                    self.view = View::List;
+                }
+            }
         }
     }
 
@@ -1658,6 +2234,10 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn test_issue() -> Issue {
         Issue {
@@ -1685,33 +2265,268 @@ mod tests {
     }
 
     #[test]
-    fn prompt_placeholders_are_filled() {
-        let cfg = test_cfg(
-            "{key}: {summary} [{status}/{priority}] {labels}\n{description}\n{url}",
-            0,
-        );
-        let p = build_prompt(&cfg, &test_issue());
+    fn link_only_template_needs_no_jira_client() {
+        let cfg = test_cfg("{key}: {url} {snapshot_at}", 10);
+        let p = prepare_prompt(&cfg, None, "PROJ-7").unwrap();
+        assert!(p
+            .text
+            .contains("PROJ-7: https://x.atlassian.net/browse/PROJ-7"));
+        assert!(p.warnings.is_empty());
+        assert!(!p.text.contains("token"));
+    }
+    fn test_agent() -> HerdrAgent {
+        HerdrAgent {
+            target: "pane-1".into(),
+            label: "agent".into(),
+            status: "idle".into(),
+            cwd: String::new(),
+            pane_id: "pane-1".into(),
+        }
+    }
+
+    fn pending_handoff(app: &mut App) -> u64 {
+        let token = app.next_token();
+        app.handoff = Some(HandoffOperation {
+            token,
+            key: "PROJ-7".into(),
+            destination: HandoffDestination::Existing(test_agent()),
+            submit: true,
+            startup: 0,
+            wait_ready: 100,
+        });
+        app.handoff_loading = true;
+        token
+    }
+
+    #[test]
+    fn partial_preparation_requires_confirmation_and_escape_invalidates_it() {
+        let mut app = list_app();
+        let token = pending_handoff(&mut app);
+        app.wizard_issue = Some(test_issue());
+        app.delegate_to(test_agent());
+        assert_eq!(app.handoff.as_ref().unwrap().token, token);
+        let mut another = test_issue();
+        another.key = "PROJ-8".into();
+        app.issues.push(another);
+        app.selected = 1;
+        app.on_resp(Resp::HandoffPrepared {
+            token,
+            result: Ok(PromptPreview {
+                key: "PROJ-7".into(),
+                text: "bounded snapshot".into(),
+                warnings: vec!["Comments capped".into()],
+            }),
+        });
+        assert_eq!(app.view, View::HandoffConfirm);
+        assert_eq!(app.handoff_preview.as_ref().unwrap().key, "PROJ-7");
+        assert!(!app.handoff_loading);
         assert_eq!(
-            p,
-            "PROJ-7: Fix login [To Do/High] auth, urgent\nSteps to reproduce…\nhttps://x.atlassian.net/browse/PROJ-7"
+            app.handoff_preview.as_ref().unwrap().text,
+            "bounded snapshot"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.handoff.is_none());
+        assert!(app.handoff_preview.is_none());
+        app.on_resp(Resp::HandoffPrepared {
+            token,
+            result: Err("late error".into()),
+        });
+        assert!(app.handoff_error.is_none());
+        let next = pending_handoff(&mut app);
+        app.on_resp(Resp::HandoffPrepared {
+            token: next,
+            result: Ok(PromptPreview {
+                key: "PROJ-7".into(),
+                text: "confirmed bounded snapshot".into(),
+                warnings: vec!["Description truncated".into()],
+            }),
+        });
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::List);
+        assert!(app.handoff_loading);
+        assert_eq!(app.handoff.as_ref().unwrap().token, next);
+        assert_eq!(
+            app.handoff_preview.as_ref().unwrap().text,
+            "confirmed bounded snapshot"
         );
     }
 
     #[test]
-    fn long_descriptions_are_truncated() {
-        let cfg = test_cfg("{description}", 10);
-        let mut issue = test_issue();
-        issue.description = "x".repeat(50);
-        let p = build_prompt(&cfg, &issue);
-        assert!(p.starts_with("xxxxxxxxxx\n[… description truncated]"));
+    fn failed_fresh_read_cannot_dispatch_and_only_known_unsent_panes_can_retry() {
+        let mut app = list_app();
+        let token = pending_handoff(&mut app);
+        app.on_resp(Resp::HandoffPrepared {
+            token,
+            result: Err("HTTP 401".into()),
+        });
+        assert!(app.handoff.is_none());
+        assert!(app.handoff_error.as_ref().unwrap().contains("HTTP 401"));
+        let token = pending_handoff(&mut app);
+        app.handoff_preview = Some(PromptPreview {
+            key: "PROJ-7".into(),
+            text: "frozen".into(),
+            warnings: vec![],
+        });
+        app.on_resp(Resp::Delegated {
+            token,
+            key: "PROJ-7".into(),
+            label: "agent".into(),
+            submitted: true,
+            result: Err(herdr::DelegationFailure {
+                message: "not ready".into(),
+                agent: Some(test_agent()),
+                retry_safe: true,
+            }),
+        });
+        assert_eq!(app.handoff_recovery_agent().unwrap().target, "pane-1");
+        assert_eq!(app.recovery.as_ref().unwrap().preview.text, "frozen");
+        press(&mut app, KeyCode::Char('D'));
+        let token = app.handoff.as_ref().unwrap().token;
+        assert!(app.handoff_loading);
+        assert_eq!(app.handoff.as_ref().unwrap().key, "PROJ-7");
+        assert_eq!(app.handoff_preview.as_ref().unwrap().text, "frozen");
+        app.on_resp(Resp::Delegated {
+            token,
+            key: "PROJ-7".into(),
+            label: "agent".into(),
+            submitted: true,
+            result: Err(herdr::DelegationFailure {
+                message: "send failed".into(),
+                agent: Some(test_agent()),
+                retry_safe: false,
+            }),
+        });
+        assert!(app.recovery.is_none());
+        assert!(app
+            .handoff_error
+            .as_ref()
+            .unwrap()
+            .contains("delivery unknown"));
     }
 
     #[test]
-    fn empty_description_gets_placeholder() {
-        let cfg = test_cfg("{description}", 0);
-        let mut issue = test_issue();
-        issue.description = "  ".into();
-        assert_eq!(build_prompt(&cfg, &issue), "(no description)");
+    fn recovery_survives_reload_and_retries_only_known_unsent_same_pane() {
+        const CHILD: &str = "JIRA_APP_RECOVERY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = std::env::temp_dir().join(format!(
+                "jira-recovery-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "[jira]\nbase_url = \"http://127.0.0.1:1\"\nauth = \"bearer\"\napi_token = \"isolated\"\n",
+            ).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::recovery_survives_reload_and_retries_only_known_unsent_same_pane",
+                ])
+                .env(CHILD, "1")
+                .env("HERDR_PLUGIN_CONFIG_DIR", &dir)
+                .output()
+                .unwrap();
+            std::fs::remove_file(dir.join("config.toml")).unwrap();
+            std::fs::remove_dir(dir).unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            return;
+        }
+
+        let mut app = list_app();
+        let token = pending_handoff(&mut app);
+        app.handoff_preview = Some(PromptPreview {
+            key: "PROJ-7".into(),
+            text: "original exact prompt".into(),
+            warnings: vec![],
+        });
+        app.on_resp(Resp::Delegated {
+            token,
+            key: "PROJ-7".into(),
+            label: "agent".into(),
+            submitted: true,
+            result: Err(herdr::DelegationFailure {
+                message: "pane not ready".into(),
+                agent: Some(test_agent()),
+                retry_safe: true,
+            }),
+        });
+        assert!(screen(&app).contains("D recheck and send"));
+        assert!(screen(&app).contains("pane pane-1"));
+        let obsolete = pending_handoff(&mut app); // a prepared read, not a dispatched write
+        assert!(app.reload_config());
+        assert!(app.handoff.is_none());
+        assert_eq!(
+            app.recovery.as_ref().unwrap().preview.text,
+            "original exact prompt"
+        );
+        app.on_resp(Resp::HandoffPrepared {
+            token: obsolete,
+            result: Err("obsolete read".into()),
+        });
+        assert!(app
+            .handoff_error
+            .as_ref()
+            .unwrap()
+            .contains("pane not ready"));
+        app.issues = vec![named_issue("PROJ-8")];
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.handoff_loading);
+        let operation = app.handoff.as_ref().unwrap();
+        assert_eq!(operation.key, "PROJ-7");
+        assert!(operation.submit);
+        assert_eq!(operation.wait_ready, 100);
+        let HandoffDestination::Existing(agent) = &operation.destination else {
+            panic!("retry must target the existing pane");
+        };
+        assert_eq!(agent.target, "pane-1");
+        assert_eq!(
+            app.handoff_preview.as_ref().unwrap().text,
+            "original exact prompt"
+        );
+        let retry_token = operation.token;
+        assert!(!app.reload_config()); // no cancellation of an already-dispatched retry
+        assert!(app.handoff.is_some());
+        app.on_resp(Resp::Delegated {
+            token: retry_token,
+            key: "PROJ-7".into(),
+            label: "agent".into(),
+            submitted: true,
+            result: Err(herdr::DelegationFailure {
+                message: "pane still not ready".into(),
+                agent: Some(test_agent()),
+                retry_safe: true,
+            }),
+        });
+        assert_eq!(app.recovery.as_ref().unwrap().agent.target, "pane-1");
+        assert_eq!(
+            app.recovery.as_ref().unwrap().preview.text,
+            "original exact prompt"
+        );
+        press(&mut app, KeyCode::Char('D'));
+        let retry_token = app.handoff.as_ref().unwrap().token;
+        app.on_resp(Resp::Delegated {
+            token: retry_token,
+            key: "PROJ-7".into(),
+            label: "agent".into(),
+            submitted: true,
+            result: Err(herdr::DelegationFailure {
+                message: "uncertain send".into(),
+                agent: Some(test_agent()),
+                retry_safe: false,
+            }),
+        });
+        assert!(app.recovery.is_none());
+        press(&mut app, KeyCode::Char('D'));
+        assert!(app.handoff.is_none());
+        assert!(!screen(&app).contains("D recheck and send"));
     }
 
     fn branch_for(template: &str, summary: &str) -> String {
@@ -1950,32 +2765,922 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::WorktreeRepoInput);
     }
+    fn named_issue(key: &str) -> Issue {
+        let mut issue = test_issue();
+        issue.key = key.into();
+        issue
+    }
+
+    fn screen(app: &App) -> String {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn wizard_headings_follow_captured_issue_across_list_replacement() {
+        let mut app = list_app();
+        app.issues.push(named_issue("PROJ-8"));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.wizard_issue_key(), Some("PROJ-7"));
+        app.issues = vec![named_issue("PROJ-8")];
+        app.selected = 0;
+        for (view, heading) in [
+            (View::AgentPicker, "delegate PROJ-7 to agent"),
+            (View::NewAgentTypePicker, "start agent for PROJ-7"),
+            (View::WorktreeProjectPicker, "worktree for PROJ-7 — project"),
+            (View::WorktreeRepoInput, "worktree for PROJ-7 — repo path"),
+            (View::WorktreeListPicker, "worktree for PROJ-7 —"),
+            (View::WorktreeNameInput, "new worktree for PROJ-7"),
+            (
+                View::WorktreeAgentPicker,
+                "worktree for PROJ-7 — start an agent",
+            ),
+        ] {
+            app.view = view;
+            let rendered = screen(&app);
+            assert!(rendered.contains(heading), "{view:?}: {rendered}");
+            assert!(!rendered.contains("worktree for PROJ-8"), "{rendered}");
+        }
+        app.view = View::WorktreeAgentPicker;
+        app.wt_repo = temp_dir();
+        app.wt_branch = "PROJ-7".into();
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.handoff.as_ref().unwrap().key, "PROJ-7");
+        let HandoffDestination::New(opts) = &app.handoff.as_ref().unwrap().destination else {
+            panic!("worktree agent must start a new pane");
+        };
+        assert_eq!(opts.tab_label, "PROJ-7");
+    }
+
+    #[test]
+    fn detail_status_exit_unpins_before_next_delegate_and_worktree() {
+        let mut app = list_app();
+        app.issues.push(named_issue("PROJ-8"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.detail_key.as_deref(), Some("PROJ-7"));
+        app.view = View::TransitionPicker;
+        press(&mut app, KeyCode::Esc);
+        assert!(app.detail_key.is_none());
+        assert!(app.detail_issue.is_none());
+        app.selected = 1;
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.wizard_issue_key(), Some("PROJ-8"));
+        assert!(screen(&app).contains("delegate PROJ-8 to agent"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.wizard_issue_key().is_none());
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.wizard_issue_key(), Some("PROJ-8"));
+        assert!(screen(&app).contains("worktree for PROJ-8"));
+        assert_eq!(app.wt_default_branch, "PROJ-8");
+    }
+
+    #[test]
+    fn worktree_picker_and_operation_keep_its_original_issue_after_page_change() {
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.view, View::WorktreeProjectPicker);
+        app.issues = vec![named_issue("PROJ-8")];
+        assert!(screen(&app).contains("worktree for PROJ-7 — project"));
+        app.on_resp(Resp::Projects(Ok(vec![project("checkout", true)])));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert!(screen(&app).contains("worktree for PROJ-7"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.wt_name_input, "PROJ-7");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('2'));
+        let op = app.handoff.as_ref().unwrap();
+        assert_eq!(op.key, "PROJ-7");
+        let HandoffDestination::New(opts) = &op.destination else {
+            panic!("worktree agent must use the frozen issue");
+        };
+        assert_eq!(opts.tab_label, "PROJ-7");
+        assert_eq!(opts.worktree.as_ref().unwrap().branch, "PROJ-7");
+    }
+
+    #[test]
+    fn detail_origin_survives_transient_list_and_confirmation() {
+        let mut app = list_app();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        app.view = View::List; // selecting an agent temporarily shows the list during prep
+        let token = pending_handoff(&mut app);
+        app.on_resp(Resp::HandoffPrepared {
+            token,
+            result: Ok(PromptPreview {
+                key: "PROJ-7".into(),
+                text: "review first".into(),
+                warnings: vec!["partial snapshot".into()],
+            }),
+        });
+        assert_eq!(app.view, View::HandoffConfirm);
+        assert_eq!(app.base_view(), View::Detail);
+        assert_eq!(app.detail_key.as_deref(), Some("PROJ-7"));
+        assert_eq!(app.wizard_issue_key(), Some("PROJ-7"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.detail_key.as_deref(), Some("PROJ-7"));
+        app.on_resp(Resp::Delegated {
+            token,
+            key: "PROJ-7".into(),
+            label: "agent".into(),
+            submitted: true,
+            result: Err(herdr::DelegationFailure {
+                message: "send status unknown".into(),
+                agent: Some(test_agent()),
+                retry_safe: false,
+            }),
+        });
+        assert_eq!(app.view, View::Detail);
+        assert!(app.wizard_issue_key().is_none());
+        assert!(app.recovery.is_none());
+    }
+
+    #[test]
+    fn detail_origin_worktree_confirmation_restores_detail_after_dispatch() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.view, View::WorktreeListPicker);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.view, View::List);
+        assert_eq!(app.help_return, View::Detail);
+        assert_eq!(app.detail_key.as_deref(), Some("PROJ-7"));
+        let token = app.handoff.as_ref().unwrap().token;
+        app.on_resp(Resp::HandoffPrepared {
+            token,
+            result: Ok(PromptPreview {
+                key: "PROJ-7".into(),
+                text: "worktree prompt".into(),
+                warnings: vec!["snapshot incomplete".into()],
+            }),
+        });
+        assert_eq!(app.base_view(), View::Detail);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.detail_key.as_deref(), Some("PROJ-7"));
+    }
+
+    fn page<T>(items: Vec<T>, total: Option<usize>, has_more: bool) -> Page<T> {
+        Page {
+            items,
+            total,
+            has_more,
+        }
+    }
+
+    #[test]
+    fn reverse_order_queries_keep_active_title_error_and_cached_rows() {
+        let mut app = list_app();
+        app.run_search("login".into());
+        let old = app.query_generation;
+        app.spawn_search(
+            "project = PROJ ORDER BY updated DESC".into(),
+            "custom JQL".into(),
+        );
+        let current = app.query_generation;
+        app.on_resp(Resp::Issues {
+            generation: old,
+            result: Err("stale unauthorized".into()),
+        });
+        assert!(app.list_error.is_none());
+        assert_eq!(app.current_title, "custom JQL");
+        app.on_resp(Resp::Issues {
+            generation: current,
+            result: Err("401 unauthorized".into()),
+        });
+        assert_eq!(app.issues[0].key, "PROJ-7");
+        assert_eq!(app.list_error.as_deref(), Some("401 unauthorized"));
+        app.toast = None; // a toast expiring cannot erase the persistent failure
+        assert!(app.list_error.is_some());
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.last_jql, "project = PROJ ORDER BY updated DESC");
+        assert_eq!(app.current_title, "custom JQL");
+        app.on_resp(Resp::Issues {
+            generation: current + 1,
+            result: Ok(page(vec![], Some(0), false)),
+        });
+        assert!(app.issues.is_empty());
+        assert!(app.list_error.is_none());
+    }
+
+    #[test]
+    fn query_refresh_preserves_key_then_clamps_when_removed() {
+        let mut app = list_app();
+        app.issues = vec![
+            named_issue("PROJ-1"),
+            named_issue("PROJ-2"),
+            named_issue("PROJ-3"),
+        ];
+        app.selected = 1;
+        app.spawn_search("text ~ \"login\"".into(), "search: login".into());
+        let generation = app.query_generation;
+        app.on_resp(Resp::Issues {
+            generation,
+            result: Ok(page(
+                vec![named_issue("PROJ-3"), named_issue("PROJ-2")],
+                Some(73),
+                true,
+            )),
+        });
+        assert_eq!(app.selected_issue().unwrap().key, "PROJ-2");
+        assert_eq!(app.issues_total, Some(73));
+        assert!(app.issues_has_more);
+        app.pending_transition = Some(PendingTransition {
+            token: 42,
+            key: "PROJ-2".into(),
+        });
+        app.on_resp(Resp::Transitioned {
+            key: "PROJ-2".into(),
+            name: "In Progress".into(),
+            token: 42,
+            result: Ok(()),
+        });
+        assert_eq!(app.last_jql, "text ~ \"login\"");
+        assert_eq!(app.current_title, "search: login");
+        app.on_resp(Resp::Issues {
+            generation: app.query_generation,
+            result: Ok(page(vec![named_issue("PROJ-3")], Some(1), false)),
+        });
+        assert_eq!(app.selected_issue().unwrap().key, "PROJ-3");
+        assert!(!app.issues_has_more);
+    }
+
+    #[test]
+    fn late_children_are_ignored_after_collapse_query_and_reload_invalidation() {
+        let mut app = list_app();
+        app.issues[0].issue_type = "Epic".into();
+        app.expanded.insert("PROJ-7".into());
+        app.child_requests.insert("PROJ-7".into(), 1);
+        app.loading_children.insert("PROJ-7".into());
+        app.collapse_epic();
+        app.on_resp(Resp::Children {
+            epic: "PROJ-7".into(),
+            token: 1,
+            result: Ok(page(vec![named_issue("PROJ-8")], Some(1), false)),
+        });
+        assert!(app.children.is_empty());
+        app.expanded.insert("PROJ-7".into());
+        app.child_requests.insert("PROJ-7".into(), 2);
+        app.spawn_search("new".into(), "new query".into());
+        app.on_resp(Resp::Children {
+            epic: "PROJ-7".into(),
+            token: 2,
+            result: Ok(page(vec![named_issue("PROJ-8")], Some(1), false)),
+        });
+        assert!(app.children.is_empty());
+        let generation = app.query_generation;
+        app.invalidate_requests(); // same invalidation reload_config uses, without reading environment
+        app.on_resp(Resp::Issues {
+            generation,
+            result: Ok(page(vec![], Some(0), false)),
+        });
+        assert_eq!(app.issues.len(), 1);
+    }
+
+    #[test]
+    fn detail_and_comments_pin_key_and_recover_after_error() {
+        let mut app = list_app();
+        app.issues.push(named_issue("PROJ-8"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.detail_key.as_deref(), Some("PROJ-7"));
+        app.issues.swap(0, 1);
+        assert_eq!(app.selected_issue().unwrap().key, "PROJ-7");
+        app.detail_request = Some(2);
+        app.detail_loading = true;
+        app.comment_requests.insert("PROJ-7".into(), 3);
+        app.comments_loading.insert("PROJ-7".into());
+        app.on_resp(Resp::Detail {
+            key: "PROJ-8".into(),
+            token: 2,
+            result: Ok(named_issue("PROJ-8")),
+        });
+        assert!(app.detail_loading);
+        app.on_resp(Resp::Detail {
+            key: "PROJ-7".into(),
+            token: 2,
+            result: Err("forbidden".into()),
+        });
+        assert_eq!(app.selected_issue().unwrap().key, "PROJ-7");
+        assert_eq!(app.detail_error.as_deref(), Some("forbidden"));
+        app.on_resp(Resp::Comments {
+            key: "PROJ-7".into(),
+            token: 3,
+            result: Err("timeout".into()),
+        });
+        assert_eq!(app.comments_err["PROJ-7"], "timeout");
+        app.detail_request = Some(4);
+        app.comment_requests.insert("PROJ-7".into(), 5);
+        let mut fresh = named_issue("PROJ-7");
+        fresh.description = "current description".into();
+        app.on_resp(Resp::Detail {
+            key: "PROJ-7".into(),
+            token: 2,
+            result: Ok(named_issue("PROJ-7")),
+        });
+        app.on_resp(Resp::Detail {
+            key: "PROJ-7".into(),
+            token: 4,
+            result: Ok(fresh),
+        });
+        app.on_resp(Resp::Comments {
+            key: "PROJ-7".into(),
+            token: 5,
+            result: Ok(page(vec![], Some(0), false)),
+        });
+        assert_eq!(
+            app.selected_issue().unwrap().description,
+            "current description"
+        );
+        assert!(app.detail_error.is_none());
+        assert!(app.comments_err.is_empty());
+    }
+
+    #[test]
+    fn read_invalidation_rejects_stale_gets_but_preserves_dispatched_post() {
+        let mut app = list_app();
+        app.spawn_search("project = PROJ".into(), "Project".into());
+        press(&mut app, KeyCode::Enter);
+        app.detail_request = Some(10);
+        app.comment_requests.insert("PROJ-7".into(), 11);
+        app.transitions_request = Some(12);
+        app.pending_transition = Some(PendingTransition {
+            token: 13,
+            key: "PROJ-7".into(),
+        });
+        app.transitions_for = "PROJ-7".into();
+        let prior_generation = app.query_generation;
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.last_jql, "project = PROJ");
+        app.on_resp(Resp::Issues {
+            generation: prior_generation,
+            result: Err("stale query failed".into()),
+        });
+        assert!(app.list_error.is_none());
+        app.detail_request = Some(20);
+        app.comment_requests.insert("PROJ-7".into(), 21);
+        app.invalidate_requests();
+        app.on_resp(Resp::Detail {
+            key: "PROJ-7".into(),
+            token: 20,
+            result: Ok(named_issue("PROJ-7")),
+        });
+        app.on_resp(Resp::Comments {
+            key: "PROJ-7".into(),
+            token: 21,
+            result: Ok(page(vec![], Some(0), false)),
+        });
+        app.on_resp(Resp::Transitions {
+            key: "PROJ-7".into(),
+            token: 12,
+            result: Ok(vec![]),
+        });
+        app.on_resp(Resp::Transitioned {
+            key: "PROJ-7".into(),
+            name: "Done".into(),
+            token: 13,
+            result: Ok(()),
+        });
+        assert!(app.comments.is_empty());
+        assert!(app
+            .detail_issue
+            .as_ref()
+            .is_some_and(|i| i.description == "Steps to reproduce…"));
+        assert_eq!(app.current_title, "Project");
+        assert!(app.pending_transition.is_none());
+    }
+
+    #[test]
+    fn transition_reply_owns_only_its_post_while_new_picker_and_query_remain_current() {
+        let mut app = list_app();
+        let mut cfg = test_cfg("{key}", 0);
+        cfg.jira.base_url = "http://127.0.0.1:1".into();
+        cfg.jira.auth = "bearer".into();
+        cfg.jira.api_token = "local-only".into();
+        app.client = Some(Arc::new(JiraClient::new(&cfg).unwrap()));
+        app.issues.push(named_issue("PROJ-8"));
+        app.spawn_search("project = OLD".into(), "old query".into());
+        let write_token = app.next_token();
+        app.pending_transition = Some(PendingTransition {
+            token: write_token,
+            key: "PROJ-7".into(),
+        });
+        app.selected = 1;
+        app.request_transitions();
+        let stale_get = app.transitions_request.unwrap();
+        app.spawn_search("project = NEW".into(), "current query".into());
+        app.invalidate_requests(); // a read invalidation cannot revoke a dispatched POST
+        app.request_transitions();
+        let current_get = app.transitions_request.unwrap();
+        app.picker_sel = 1;
+        app.on_resp(Resp::Transitioned {
+            token: write_token,
+            key: "PROJ-8".into(),
+            name: "wrong issue".into(),
+            result: Ok(()),
+        });
+        assert!(app.pending_transition.is_some());
+        app.on_resp(Resp::Transitioned {
+            token: write_token,
+            key: "PROJ-7".into(),
+            name: "Done".into(),
+            result: Ok(()),
+        });
+        assert!(app.pending_transition.is_none());
+        assert_eq!(app.last_jql, "project = NEW");
+        assert_eq!(app.current_title, "current query");
+        assert_eq!(app.view, View::TransitionPicker);
+        assert_eq!(app.transitions_for, "PROJ-8");
+        assert_eq!(app.transitions_request, Some(current_get));
+        assert_eq!(app.picker_sel, 1);
+        app.on_resp(Resp::Transitions {
+            token: stale_get,
+            key: "PROJ-8".into(),
+            result: Ok(vec![]),
+        });
+        assert!(app.transitions_loading);
+        app.on_resp(Resp::Transitions {
+            token: current_get,
+            key: "PROJ-8".into(),
+            result: Ok(vec![Transition {
+                id: "4".into(),
+                name: "Start".into(),
+                to_status: "Doing".into(),
+            }]),
+        });
+        assert_eq!(app.transitions[0].name, "Start");
+        assert_eq!(app.view, View::TransitionPicker);
+    }
+
+    #[test]
+    fn transition_error_and_second_apply_keep_b_picker_without_overwriting_writer() {
+        let mut app = list_app();
+        let mut cfg = test_cfg("{key}", 0);
+        cfg.jira.base_url = "http://127.0.0.1:1".into();
+        cfg.jira.auth = "bearer".into();
+        cfg.jira.api_token = "local-only".into();
+        app.client = Some(Arc::new(JiraClient::new(&cfg).unwrap()));
+        app.pending_transition = Some(PendingTransition {
+            token: 91,
+            key: "PROJ-7".into(),
+        });
+        app.transitions_for = "PROJ-8".into();
+        app.transitions = vec![Transition {
+            id: "4".into(),
+            name: "Start".into(),
+            to_status: "Doing".into(),
+        }];
+        app.view = View::TransitionPicker;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::TransitionPicker);
+        assert_eq!(app.pending_transition.as_ref().unwrap().key, "PROJ-7");
+        assert!(matches!(&app.toast, Some((_, true, _))));
+        assert!(!app.reload_config());
+        assert_eq!(app.pending_transition.as_ref().unwrap().key, "PROJ-7");
+        assert_eq!(app.view, View::TransitionPicker);
+        app.view = View::List;
+        press(&mut app, KeyCode::Char('R'));
+        assert!(app.toast.as_ref().is_some_and(|(_, error, _)| *error));
+        assert_eq!(app.pending_transition.as_ref().unwrap().key, "PROJ-7");
+        app.view = View::TransitionPicker;
+        app.on_resp(Resp::Transitioned {
+            token: 91,
+            key: "PROJ-7".into(),
+            name: "Done".into(),
+            result: Err("HTTP 409".into()),
+        });
+        assert!(app.pending_transition.is_none());
+        assert_eq!(app.view, View::TransitionPicker);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, error, _)| *error && message.contains("HTTP 409")));
+        assert_eq!(app.transitions[0].name, "Start");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_transition.as_ref().unwrap().key, "PROJ-8");
+        assert_eq!(app.view, View::List);
+    }
+
+    #[test]
+    fn expanded_children_keep_selected_sibling_key_and_bound_metadata() {
+        let mut app = list_app();
+        app.issues[0].issue_type = "Epic".into();
+        app.issues.push(named_issue("PROJ-9"));
+        app.selected = 1;
+        app.expanded.insert("PROJ-7".into());
+        app.child_requests.insert("PROJ-7".into(), 12);
+        app.on_resp(Resp::Children {
+            epic: "PROJ-7".into(),
+            token: 12,
+            result: Ok(page(vec![named_issue("PROJ-8")], Some(4), true)),
+        });
+        assert_eq!(app.selected_issue().unwrap().key, "PROJ-9");
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.children_total["PROJ-7"], 4);
+        assert!(app.children_has_more.contains("PROJ-7"));
+    }
+
+    /// Reply to the parent query and observe any subsequent fallback query.
+    fn epic_fixture(
+        replies: Vec<Option<(u16, &'static str)>>,
+    ) -> (
+        App,
+        thread::JoinHandle<Vec<String>>,
+        std::sync::mpsc::Receiver<Resp>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut targets = Vec::new();
+            let mut deadline = Instant::now() + Duration::from_secs(3);
+            'requests: while targets.len() <= replies.len() {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0u8; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = match stream.read(&mut bytes) {
+                        Ok(0) if request.is_empty() => continue 'requests,
+                        Ok(count) => count,
+                        Err(error)
+                            if request.is_empty()
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                        {
+                            continue 'requests;
+                        }
+                        Err(error) => panic!("incomplete fixture request: {error}"),
+                    };
+                    assert!(count > 0 && request.len() + count < 16_384);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let target = String::from_utf8(request)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                targets.push(target);
+                let reply = replies
+                    .get(targets.len() - 1)
+                    .copied()
+                    .flatten()
+                    .or_else(|| {
+                        (targets.len() > replies.len())
+                            .then_some((200, r#"{"issues":[],"total":0,"startAt":0}"#))
+                    });
+                if let Some((code, body)) = reply {
+                    let response = format!(
+                        "HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+                deadline = Instant::now() + Duration::from_millis(350);
+            }
+            targets
+        });
+        let mut cfg = test_cfg("{key}", 0);
+        cfg.jira.base_url = base;
+        cfg.jira.auth = "bearer".into();
+        cfg.jira.api_token = "test".into();
+        let client = JiraClient::new(&cfg).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::unloaded(tx);
+        app.client = Some(Arc::new(client));
+        app.issues = vec![test_issue()];
+        app.issues[0].issue_type = "Epic".into();
+        (app, server, rx)
+    }
+    #[test]
+    fn snapshot_reads_fresh_fields_and_bounds_comments_without_replacing_jira_placeholders() {
+        let (app, server, _) = epic_fixture(vec![
+            Some((
+                200,
+                r#"{"key":"PROJ-7","fields":{"summary":"Fresh {status}","status":{"name":"In Progress"},"updated":"2026-10-11T12:30:00.000+0000","description":"abcdef"}}"#,
+            )),
+            Some((
+                200,
+                r#"{"startAt":0,"maxResults":1,"total":3,"comments":[{"id":"app-snapshot-1","author":{"displayName":"Ada"},"created":"2026-10-10T09:30:00.000+0000","body":"secret {key} content"}]}"#,
+            )),
+        ]);
+        let mut cfg = test_cfg(
+            "{key} {summary} {status} {updated} {description} {comments} {snapshot_at}",
+            3,
+        );
+        cfg.delegate.max_comments = 1;
+        cfg.delegate.max_comment_chars = 12;
+        let preview = prepare_prompt(&cfg, app.client.as_deref(), "PROJ-7").unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("/issue/PROJ-7?"));
+        assert!(requests[1].contains("maxResults=1"));
+        assert!(preview
+            .text
+            .contains("Fresh {status} In Progress 2026-10-11 12:30 abc"));
+        assert!(!preview.text.contains("secret {key} content"));
+        assert_eq!(preview.warnings.len(), 3);
+        assert!(!preview.text.contains("Bearer test"));
+        assert!(!preview.text.contains("Authorization"));
+    }
+    #[test]
+    fn zero_budgets_omit_content_and_warn_instead_of_becoming_unlimited() {
+        let (app, server, _) = epic_fixture(vec![
+            Some((
+                200,
+                r#"{"key":"PROJ-7","fields":{"description":"secret description"}}"#,
+            )),
+            Some((
+                200,
+                r#"{"startAt":0,"maxResults":1,"total":1,"comments":[{"id":"app-zero-1","author":{"displayName":"Ada"},"created":"2026-10-10T09:30:00.000+0000","body":"secret comment"}]}"#,
+            )),
+        ]);
+        let mut cfg = test_cfg("{description} {comments}", 0);
+        cfg.delegate.max_comments = 0;
+        cfg.delegate.max_comment_chars = 0;
+        let preview = prepare_prompt(&cfg, app.client.as_deref(), "PROJ-7").unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("maxResults=1"));
+        assert_eq!(preview.warnings.len(), 3);
+        assert!(!preview.text.contains("secret"));
+    }
+
+    fn expand_from_fixture(status: Option<(u16, &'static str)>) -> (App, Vec<String>) {
+        let (mut app, server, rx) = epic_fixture(vec![status]);
+        app.expand_epic();
+        let response = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        app.on_resp(response);
+        (app, server.join().unwrap())
+    }
+
+    #[test]
+    fn epic_auth_and_transport_failures_remain_visible_without_alternate_search() {
+        for (status, expected) in [
+            (
+                Some((401, r#"{"errorMessages":["invalid token"]}"#)),
+                "HTTP 401: invalid token",
+            ),
+            (None, "request failed:"),
+            (
+                Some((
+                    400,
+                    r#"{"errorMessages":["Invalid JQL syntax near parent"]}"#,
+                )),
+                "HTTP 400:",
+            ),
+            (
+                Some((
+                    400,
+                    r#"{"errorMessages":["Field 'parent' does not exist or you do not have permission"]}"#,
+                )),
+                "HTTP 400:",
+            ),
+        ] {
+            let (app, requests) = expand_from_fixture(status);
+            assert_eq!(
+                requests.len(),
+                1,
+                "unexpected Epic Link retry: {requests:?}"
+            );
+            assert!(requests[0].contains("parent"));
+            assert!(app.children.is_empty());
+            assert!(app.expanded.contains("PROJ-7"));
+            assert!(!app.loading_children.contains("PROJ-7"));
+            assert!(app.children_err["PROJ-7"].contains(expected));
+            assert!(app
+                .toast
+                .as_ref()
+                .is_some_and(|(message, error, _)| *error && message.contains(expected)));
+        }
+    }
+
+    #[test]
+    fn epic_link_fallback_only_for_unsupported_parent_field() {
+        let (mut app, server, rx) = epic_fixture(vec![
+            Some((404, r#"{"errorMessages":["Cloud endpoint unavailable"]}"#)),
+            Some((
+                400,
+                r#"{"errorMessages":["Field 'parent' does not exist"]}"#,
+            )),
+            Some((404, r#"{"errorMessages":["Cloud endpoint unavailable"]}"#)),
+            Some((200, r#"{"issues":[],"total":0,"startAt":0}"#)),
+        ]);
+        app.expand_epic();
+        app.on_resp(rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[..2]
+            .iter()
+            .all(|request| request.contains("parent")));
+        assert!(requests[2..]
+            .iter()
+            .all(|request| request.contains("Epic") && request.contains("Link")));
+        assert!(requests[1].starts_with("/rest/api/2/search?"));
+        assert!(requests[3].starts_with("/rest/api/2/search?"));
+        assert_eq!(app.children["PROJ-7"].len(), 0);
+        assert!(!app.children_err.contains_key("PROJ-7"));
+    }
+
+    #[test]
+    fn epic_later_page_error_does_not_trigger_field_fallback() {
+        let (mut app, server, rx) = epic_fixture(vec![
+            Some((
+                200,
+                r#"{"issues":[{"key":"PROJ-8","fields":{}}],"nextPageToken":"second","isLast":false}"#,
+            )),
+            Some((
+                400,
+                r#"{"errorMessages":["Field 'parent' does not exist"]}"#,
+            )),
+        ]);
+        app.expand_epic();
+        app.on_resp(rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "unexpected Epic Link retry: {requests:?}"
+        );
+        assert!(requests[1].contains("nextPageToken"));
+        assert!(app.children.is_empty());
+        assert!(app.children_err["PROJ-7"].starts_with("Jira search later page: HTTP 400:"));
+    }
 }
 
-/// Fill the delegate prompt template with issue fields.
-pub fn build_prompt(cfg: &Config, issue: &Issue) -> String {
-    let mut desc = issue.description.clone();
-    if desc.trim().is_empty() {
-        desc = "(no description)".into();
+/// Render only fields required by this template, from fresh Jira reads.
+fn prepare_prompt(
+    cfg: &Config,
+    client: Option<&JiraClient>,
+    key: &str,
+) -> Result<PromptPreview, String> {
+    let template = &cfg.delegate.prompt;
+    let needs_comments = template.contains("{comments}");
+    let needs_issue = needs_comments
+        || [
+            "{summary}",
+            "{description}",
+            "{status}",
+            "{assignee}",
+            "{reporter}",
+            "{priority}",
+            "{type}",
+            "{labels}",
+            "{updated}",
+        ]
+        .iter()
+        .any(|field| template.contains(field));
+    let issue = if needs_issue {
+        Some(client.ok_or("Jira client unavailable")?.issue(key)?)
+    } else {
+        None
+    };
+    let mut warnings = Vec::new();
+    let description = if template.contains("{description}") {
+        let raw = issue.as_ref().unwrap().description.trim();
+        let max = cfg.delegate.max_description_chars;
+        if max == 0 {
+            warnings.push("Description omitted: max_description_chars is zero".into());
+            "(description omitted)".to_string()
+        } else if raw.is_empty() {
+            "(no description)".to_string()
+        } else if raw.chars().count() > max {
+            warnings.push(format!("Description truncated to {max} characters"));
+            format!(
+                "{}\n[… description truncated]",
+                raw.chars().take(max).collect::<String>()
+            )
+        } else {
+            raw.to_string()
+        }
+    } else {
+        String::new()
+    };
+    let comments = if needs_comments {
+        let limit = if cfg.delegate.max_comment_chars == 0 {
+            0
+        } else {
+            cfg.delegate.max_comments
+        };
+        let page = client.unwrap().comments_with_limit(key, limit)?;
+        if cfg.delegate.max_comments == 0 || cfg.delegate.max_comment_chars == 0 {
+            if cfg.delegate.max_comments == 0 {
+                warnings.push("Comments omitted: max_comments is zero".into());
+            }
+            if cfg.delegate.max_comment_chars == 0 {
+                warnings.push("Comments omitted: max_comment_chars is zero".into());
+            }
+            "(comments omitted)".to_string()
+        } else {
+            if page.has_more || page.total.is_some_and(|n| n > page.items.len()) {
+                warnings.push(format!("Comments capped at {}", cfg.delegate.max_comments));
+            }
+            let mut text = String::new();
+            for comment in &page.items {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&format!(
+                    "{} ({})\n{}",
+                    comment.author, comment.created, comment.body
+                ));
+            }
+            let max = cfg.delegate.max_comment_chars;
+            if text.chars().count() > max {
+                warnings.push(format!("Comments truncated to {max} characters"));
+                format!(
+                    "{}\n[… comments truncated]",
+                    text.chars().take(max).collect::<String>()
+                )
+            } else if text.is_empty() {
+                "(no comments)".to_string()
+            } else {
+                text
+            }
+        }
+    } else {
+        String::new()
+    };
+    let labels = issue
+        .as_ref()
+        .map(|i| i.labels.join(", "))
+        .unwrap_or_default();
+    let url = issue
+        .as_ref()
+        .map(|i| i.url.clone())
+        .unwrap_or_else(|| format!("{}/browse/{key}", cfg.jira.base_url.trim_end_matches('/')));
+    let snapshot_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("snapshot clock: {e}"))?
+        .as_secs()
+        .to_string();
+    let mut text = String::with_capacity(template.len() + description.len() + comments.len());
+    let mut rest = template.as_str();
+    while let Some(start) = rest.find('{') {
+        text.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let fields = issue.as_ref();
+        let value = [
+            ("{key}", key),
+            ("{url}", url.as_str()),
+            ("{snapshot_at}", snapshot_at.as_str()),
+            ("{description}", description.as_str()),
+            ("{comments}", comments.as_str()),
+            ("{labels}", labels.as_str()),
+            ("{summary}", fields.map_or("", |i| i.summary.as_str())),
+            ("{status}", fields.map_or("", |i| i.status.as_str())),
+            ("{updated}", fields.map_or("", |i| i.updated.as_str())),
+            ("{assignee}", fields.map_or("", |i| i.assignee.as_str())),
+            ("{reporter}", fields.map_or("", |i| i.reporter.as_str())),
+            ("{priority}", fields.map_or("", |i| i.priority.as_str())),
+            ("{type}", fields.map_or("", |i| i.issue_type.as_str())),
+        ]
+        .into_iter()
+        .find_map(|(name, value)| rest.starts_with(name).then_some(value));
+        if let Some(value) = value {
+            text.push_str(value);
+            rest = &rest[rest.find('}').unwrap() + 1..];
+        } else {
+            text.push('{');
+            rest = &rest[1..];
+        }
     }
-    let max = cfg.delegate.max_description_chars;
-    if max > 0 && desc.chars().count() > max {
-        desc = desc.chars().take(max).collect::<String>() + "\n[… description truncated]";
-    }
-    cfg.delegate
-        .prompt
-        .replace("{key}", &issue.key)
-        .replace("{summary}", &issue.summary)
-        .replace("{description}", &desc)
-        .replace("{url}", &issue.url)
-        .replace("{status}", &issue.status)
-        .replace("{assignee}", &issue.assignee)
-        .replace("{reporter}", &issue.reporter)
-        .replace("{priority}", &issue.priority)
-        .replace("{type}", &issue.issue_type)
-        .replace("{labels}", &issue.labels.join(", "))
-        .trim()
-        .to_string()
+    text.push_str(rest);
+    Ok(PromptPreview {
+        key: key.into(),
+        text: text.trim().into(),
+        warnings,
+    })
 }
 
 /// Longest `{slug}` / `{type}` substitution in worktree templates.
