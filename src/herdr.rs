@@ -19,6 +19,15 @@ pub struct HerdrAgent {
     pub pane_id: String,
 }
 
+/// An unsuccessful handoff retains the pane when one was created or selected.
+/// Only readiness failures are known not to have delivered the prompt.
+#[derive(Debug, Clone)]
+pub struct DelegationFailure {
+    pub message: String,
+    pub agent: Option<HerdrAgent>,
+    pub retry_safe: bool,
+}
+
 /// How to place a newly started agent pane.
 #[derive(Debug, Clone)]
 pub struct StartAgentOpts {
@@ -730,13 +739,7 @@ pub fn wait_agent_status(target: &str, status: &str, timeout_ms: u64) -> Result<
 /// Submit through herdr's server-side prompt operation, avoiding the race
 /// between bracketed paste and a separate Enter. Never retry via raw input on
 /// failure: that could duplicate a prompt or type it into a startup dialog.
-/// `submit_delay_ms` is retained for config/API compatibility but is unused.
-pub fn send_to_agent(
-    agent: &HerdrAgent,
-    text: &str,
-    submit: bool,
-    _submit_delay_ms: u64,
-) -> Result<(), String> {
+pub fn send_to_agent(agent: &HerdrAgent, text: &str, submit: bool) -> Result<(), String> {
     if submit {
         run(&["agent", "prompt", &agent.target, text])?;
     } else {
@@ -750,20 +753,46 @@ pub fn start_and_delegate(
     opts: &StartAgentOpts,
     text: &str,
     submit: bool,
-    submit_delay_ms: u64,
     startup_delay_ms: u64,
     wait_ready_ms: u64,
-) -> Result<HerdrAgent, String> {
-    let agent = start_agent(opts)?;
+) -> Result<HerdrAgent, DelegationFailure> {
+    let agent = start_agent(opts).map_err(|message| DelegationFailure {
+        message,
+        agent: None,
+        retry_safe: false,
+    })?;
     if startup_delay_ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(startup_delay_ms));
+        std::thread::sleep(Duration::from_millis(startup_delay_ms));
     }
+    resume_delegation(&agent, text, submit, wait_ready_ms)
+}
+
+/// Deliver to the same pane; never start an agent or open another worktree.
+/// A zero readiness budget explicitly skips the wait.
+pub fn resume_delegation(
+    agent: &HerdrAgent,
+    text: &str,
+    submit: bool,
+    wait_ready_ms: u64,
+) -> Result<HerdrAgent, DelegationFailure> {
     if wait_ready_ms > 0 {
-        wait_agent_status(&agent.target, "idle", wait_ready_ms)
-            .map_err(|e| format!("agent {} not ready; prompt not sent: {e}", agent.pane_id))?;
+        wait_agent_status(&agent.target, "idle", wait_ready_ms).map_err(|message| {
+            DelegationFailure {
+                message: format!(
+                    "agent {} not ready; prompt not sent: {message}",
+                    agent.pane_id
+                ),
+                agent: Some(agent.clone()),
+                retry_safe: true,
+            }
+        })?;
     }
-    send_to_agent(&agent, text, submit, submit_delay_ms)?;
-    Ok(agent)
+    send_to_agent(agent, text, submit).map_err(|message| DelegationFailure {
+        message,
+        agent: Some(agent.clone()),
+        retry_safe: false,
+    })?;
+    Ok(agent.clone())
 }
 
 /// Toggle fullscreen (zoom) for our own pane. Only works when running inside
