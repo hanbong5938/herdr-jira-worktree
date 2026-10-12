@@ -1,4 +1,5 @@
 mod app;
+mod checkout;
 mod config;
 mod herdr;
 mod jira;
