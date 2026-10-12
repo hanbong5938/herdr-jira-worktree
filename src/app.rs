@@ -1,6 +1,7 @@
 //! Application state and key handling. Network and herdr-CLI work runs on
 //! background threads; results come back over an mpsc channel as `Resp`.
 
+use crate::checkout::{self, Backend, Entry, Listing, Repository, Request, Selection};
 use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
 use crate::jira::{Comment, Issue, JiraClient, Page, Transition};
@@ -29,15 +30,18 @@ pub enum View {
     NewAgentCwdPicker,
     /// Free-text cwd entry (from "type path…" in the cwd picker).
     NewAgentCwdInput,
-    /// `w`: pick the herdr project (source repo) for the worktree (no `[worktree]` repo configured).
+    /// `w`: pick a herdr source repository when `[worktree]` has no configured repo.
     WorktreeProjectPicker,
     /// `w`: free-text repo path (from "type path…" in the project picker).
     WorktreeRepoInput,
-    /// `w`: the repo's worktrees; row 0 = "+ new worktree".
+    /// `w`: checkouts in the selected repository; row 0 creates a new checkout.
     WorktreeListPicker,
-    /// `w`: new worktree (branch) name, prefilled from `[worktree].branch`.
     WorktreeNameInput,
-    /// `w`: optionally start an agent in the worktree.
+    /// Enter the path to an existing jj workspace whose path is not in the listing.
+    WorktreeExistingPathInput,
+    /// Explicit inspection of an unresolved jj creation before opening Existing.
+    WorktreeRecoveryConfirm,
+    /// `w`: optionally start an agent in the checkout.
     WorktreeAgentPicker,
     SearchInput,
     JqlInput,
@@ -75,15 +79,21 @@ pub enum Resp {
     },
     /// `w` without an agent: `result` is the checkout path.
     WorktreeOpened {
-        branch: String,
+        name: String,
+        backend: Backend,
         result: Result<String, String>,
     },
-    /// `w`: herdr projects for the project picker.
-    Projects(Result<Vec<herdr::RepoProject>, String>),
-    /// `w`: checkouts of the repo at `repo`.
+    Projects {
+        token: u64,
+        result: Result<herdr::ProjectInventory, String>,
+    },
     RepoWorktrees {
-        repo: String,
-        result: Result<Vec<herdr::RepoWorktree>, String>,
+        token: u64,
+        result: Result<Listing, String>,
+    },
+    ExistingValidated {
+        token: u64,
+        result: Result<(Entry, Option<String>), String>,
     },
     Children {
         epic: String,
@@ -200,26 +210,35 @@ pub struct App {
     pub cwd_choices: Vec<String>,
     pub cwd_input: String,
 
-    /// `w` flow: validated repo dir the worktree is created from.
+    /// Source checkout path requested by the user; backend is resolved in the background.
     pub wt_repo: String,
-    /// Display name of `wt_repo` (project name or directory name).
     pub wt_repo_name: String,
-    /// The project picker was shown (Esc on the worktree list returns there).
+    pub wt_repository: Option<Repository>,
     pub wt_project_asked: bool,
-    /// herdr projects for the project picker, current one first.
     pub wt_projects: Vec<herdr::RepoProject>,
     pub wt_projects_loading: bool,
-    /// Checkouts of `wt_repo` for the worktree list.
-    pub wt_worktrees: Vec<herdr::RepoWorktree>,
+    pub wt_project_warnings: Vec<String>,
+    pub wt_project_error: Option<String>,
+    pub wt_project_warning_scroll: u16,
+    pub wt_project_warning_scroll_max: Cell<u16>,
+    pub wt_worktrees: Vec<Entry>,
     pub wt_worktrees_loading: bool,
-    /// Branch rendered from `[worktree].branch` for the selected issue.
-    pub wt_default_branch: String,
-    /// The agent picker was reached from an existing worktree (not the name input).
-    pub wt_existing: bool,
-    /// Worktree name being edited.
+    pub wt_error: Option<String>,
+    pub wt_default_name: String,
+    pub wt_selected: Option<Entry>,
     pub wt_name_input: String,
-    /// Branch the agent picker opens: sanitized new name or an existing worktree's branch.
-    pub wt_branch: String,
+    pub wt_name: String,
+    pub wt_existing_path_input: String,
+    pub wt_validating_path: bool,
+    pub wt_recovery_warning: Option<String>,
+    pub wt_recovery_scroll: u16,
+    pub wt_recovery_scroll_max: Cell<u16>,
+    wt_validated_existing: Option<Entry>,
+    wt_approved_existing: Option<Entry>,
+    wt_pending_existing: Option<Entry>,
+    wt_request_token: u64,
+    wt_projects_token: u64,
+    wt_path_token: u64,
     wizard_issue: Option<Issue>,
     handoff: Option<HandoffOperation>,
     pub handoff_preview: Option<PromptPreview>,
@@ -344,15 +363,32 @@ impl App {
             cwd_input: String::new(),
             wt_repo: String::new(),
             wt_repo_name: String::new(),
+            wt_repository: None,
             wt_project_asked: false,
             wt_projects: vec![],
+            wt_project_warnings: vec![],
+            wt_project_error: None,
+            wt_project_warning_scroll: 0,
+            wt_project_warning_scroll_max: Cell::new(0),
             wt_projects_loading: false,
             wt_worktrees: vec![],
             wt_worktrees_loading: false,
-            wt_default_branch: String::new(),
-            wt_existing: false,
+            wt_error: None,
+            wt_default_name: String::new(),
+            wt_selected: None,
             wt_name_input: String::new(),
-            wt_branch: String::new(),
+            wt_name: String::new(),
+            wt_existing_path_input: String::new(),
+            wt_validating_path: false,
+            wt_recovery_warning: None,
+            wt_recovery_scroll: 0,
+            wt_recovery_scroll_max: Cell::new(0),
+            wt_validated_existing: None,
+            wt_approved_existing: None,
+            wt_pending_existing: None,
+            wt_request_token: 0,
+            wt_projects_token: 0,
+            wt_path_token: 0,
             wizard_issue: None,
             handoff: None,
             handoff_preview: None,
@@ -515,6 +551,15 @@ impl App {
         self.workspaces_loading = false;
         self.wt_projects_loading = false;
         self.wt_worktrees_loading = false;
+        self.wt_validating_path = false;
+        self.wt_pending_existing = None;
+        self.wt_validated_existing = None;
+        self.wt_approved_existing = None;
+        self.wt_recovery_warning = None;
+        self.wt_project_warnings.clear();
+        self.wt_project_error = None;
+        self.wt_project_warning_scroll = 0;
+        self.wt_project_warning_scroll_max.set(0);
     }
 
     fn restore_handoff_origin(&mut self) {
@@ -876,7 +921,7 @@ impl App {
             focus,
             workspace_id: ws.id.clone(),
             tab_label: key.clone(),
-            worktree: None,
+            checkout: None,
         };
         let place_hint = if placement.eq_ignore_ascii_case("tab") || placement.is_empty() {
             format!("new tab in {ws_label}")
@@ -897,7 +942,7 @@ impl App {
         self.handoff = None;
         self.handoff_preview = None;
         self.handoff_loading = false;
-        self.next_token();
+        self.reset_existing_intent();
     }
 
     fn prepare_handoff(&mut self, destination: HandoffDestination, submit: bool) {
@@ -1035,10 +1080,8 @@ impl App {
         }
     }
 
-    // ---- `w`: git worktree for the selected issue ----
+    // ---- `w`: Git worktree or jj workspace for the selected issue ----
 
-    /// Resolve the repo from `[worktree]` (per project key, then the default)
-    /// or let the user pick a herdr project; then show the repo's worktrees.
     fn open_worktree(&mut self) {
         if self.handoff_loading || self.handoff.is_some() {
             return;
@@ -1049,46 +1092,44 @@ impl App {
         };
         self.help_return = self.view;
         let wcfg = &self.cfg.worktree;
-        let default_branch = render_branch_name(&wcfg.branch, issue);
         let configured = wcfg
             .repos
             .get(project_key(&issue.key))
             .filter(|r| !r.trim().is_empty())
             .or(Some(&wcfg.repo).filter(|r| !r.trim().is_empty()))
             .cloned();
-        self.wt_default_branch = default_branch;
-        self.wt_existing = false;
-        let Some(raw) = configured else {
+        self.wt_default_name.clear();
+        self.wt_selected = None;
+        self.wt_repository = None;
+        self.reset_existing_intent();
+        if let Some(raw) = configured {
+            self.wt_project_asked = false;
+            self.open_worktree_list(raw, String::new());
+        } else {
             self.wt_project_asked = true;
             self.open_worktree_project_picker();
-            return;
-        };
-        self.wt_project_asked = false;
-        match resolve_cwd(&raw) {
-            Ok(repo) => {
-                let name = dir_name(&repo);
-                self.open_worktree_list(repo, name);
-            }
-            Err(e) => {
-                self.wizard_issue = None;
-                self.toast(format!("worktree repo: {e}"), true);
-            }
         }
     }
 
-    /// Step A: fetch herdr's projects (source repos); `Resp::Projects` fills the picker.
     fn open_worktree_project_picker(&mut self) {
         self.wt_projects.clear();
+        self.wt_project_warnings.clear();
+        self.wt_project_error = None;
+        self.wt_project_warning_scroll = 0;
+        self.wt_project_warning_scroll_max.set(0);
         self.wt_projects_loading = true;
+        self.wt_projects_token = self.next_token();
         self.picker_sel = 0;
         self.view = View::WorktreeProjectPicker;
         let tx = self.tx.clone();
+        let token = self.wt_projects_token;
+        let prefer = self.cfg.worktree.prefer;
         spawn_herdr(move || {
-            let _ = tx.send(Resp::Projects(herdr::list_projects()));
+            let result = herdr::list_projects(prefer);
+            let _ = tx.send(Resp::Projects { token, result });
         });
     }
 
-    /// Back to the project picker with the chosen project (or "type path…") selected.
     fn return_to_project_picker(&mut self) {
         self.picker_sel = self
             .wt_projects
@@ -1098,48 +1139,102 @@ impl App {
         self.view = View::WorktreeProjectPicker;
     }
 
-    /// Step B: fetch the worktrees of `repo`; `Resp::RepoWorktrees` fills the list.
-    fn open_worktree_list(&mut self, repo: String, name: String) {
+    /// Resolve and list off-thread; a token rejects an older answer for the same path.
+    fn open_worktree_list(&mut self, raw: String, name: String) {
+        let repo = match resolve_cwd(&raw) {
+            Ok(repo) => repo,
+            Err(e) => {
+                self.toast(format!("repo: {e}"), true);
+                return;
+            }
+        };
         self.wt_repo = repo.clone();
-        self.wt_repo_name = name;
+        self.wt_repo_name = if name.is_empty() {
+            dir_name(&repo)
+        } else {
+            name
+        };
+        self.wt_repository = None;
         self.wt_worktrees.clear();
+        self.wt_error = None;
+        self.wt_default_name.clear();
         self.wt_worktrees_loading = true;
+        self.reset_existing_intent();
+        self.wt_request_token = self.next_token();
         self.picker_sel = 0;
         self.view = View::WorktreeListPicker;
         let tx = self.tx.clone();
+        let token = self.wt_request_token;
+        let prefer = self.cfg.worktree.prefer;
         spawn_herdr(move || {
-            let result = herdr::list_worktrees(&repo);
-            let _ = tx.send(Resp::RepoWorktrees { repo, result });
+            let result = herdr::resolve_and_list(&repo, prefer);
+            let _ = tx.send(Resp::RepoWorktrees { token, result });
         });
     }
 
-    /// Back to the worktree list with `branch`'s row (or "+ new worktree") selected.
-    fn return_to_worktree_list(&mut self, branch: Option<&str>) {
-        self.picker_sel = branch
-            .and_then(|b| self.wt_worktrees.iter().position(|w| w.branch == b))
+    fn return_to_worktree_list(&mut self, selected: Option<&Entry>) {
+        self.reset_existing_intent();
+        self.picker_sel = selected
+            .and_then(|entry| {
+                self.wt_worktrees
+                    .iter()
+                    .position(|w| w == entry || (w.path.is_none() && w.name == entry.name))
+            })
             .map_or(0, |i| i + 1);
         self.view = View::WorktreeListPicker;
     }
 
-    /// "+ new worktree": the name input, prefilled from `[worktree].branch`.
+    fn reset_existing_intent(&mut self) {
+        self.wt_validating_path = false;
+        self.wt_pending_existing = None;
+        self.wt_validated_existing = None;
+        self.wt_approved_existing = None;
+        self.wt_recovery_warning = None;
+        self.wt_recovery_scroll = 0;
+        self.wt_recovery_scroll_max.set(0);
+        self.wt_path_token = self.next_token();
+    }
+
+    /// Both recorded paths and manually located legacy paths take the same
+    /// background native identity and receipt check before reaching the agent picker.
+    fn validate_worktree_existing(&mut self, entry: Entry, path: String) {
+        let Some(repo) = self.wt_repository.clone() else {
+            return;
+        };
+        self.reset_existing_intent();
+        self.wt_pending_existing = Some(entry.clone());
+        self.wt_validating_path = true;
+        self.wt_path_token = self.next_token();
+        let token = self.wt_path_token;
+        let tx = self.tx.clone();
+        spawn_herdr(move || {
+            let result =
+                checkout::validate_existing(&repo, &entry.name, &path).and_then(|validated| {
+                    checkout::recovery_warning(&repo, &validated)
+                        .map(|warning| (validated, warning))
+                });
+            let _ = tx.send(Resp::ExistingValidated { token, result });
+        });
+    }
+
     fn open_worktree_name_input(&mut self) {
-        self.wt_name_input = self.wt_default_branch.clone();
+        self.wt_selected = None;
+        self.reset_existing_intent();
+        self.wt_name_input = self.wt_default_name.clone();
         self.view = View::WorktreeNameInput;
     }
 
     fn open_worktree_repo_input(&mut self) {
-        let pref = self
+        self.cwd_input = self
             .wt_projects
             .get(self.picker_sel)
             .or(self.wt_projects.first())
             .map(|p| p.root.clone())
             .or_else(|| std::env::var("HOME").ok())
             .unwrap_or_default();
-        self.cwd_input = pref;
         self.view = View::WorktreeRepoInput;
     }
 
-    /// Any step of the `w` flow is on screen.
     fn in_worktree_flow(&self) -> bool {
         matches!(
             self.view,
@@ -1147,73 +1242,110 @@ impl App {
                 | View::WorktreeRepoInput
                 | View::WorktreeListPicker
                 | View::WorktreeNameInput
+                | View::WorktreeExistingPathInput
                 | View::WorktreeAgentPicker
+                | View::WorktreeRecoveryConfirm
         )
     }
 
-    fn on_projects(&mut self, result: Result<Vec<herdr::RepoProject>, String>) {
-        // Stale: `w` was left, or this answers an older request.
-        if !self.wt_projects_loading || !self.in_worktree_flow() {
+    fn on_projects(&mut self, token: u64, result: Result<herdr::ProjectInventory, String>) {
+        if !self.wt_projects_loading || token != self.wt_projects_token || !self.in_worktree_flow()
+        {
             return;
         }
         self.wt_projects_loading = false;
         match result {
-            Ok(projects) => {
-                self.wt_projects = projects;
+            Ok(inventory) => {
+                self.wt_projects = inventory.projects;
+                self.wt_project_warnings = inventory.warnings;
+                self.wt_project_error = None;
+                self.wt_project_warning_scroll = 0;
                 if self.view == View::WorktreeProjectPicker {
                     self.picker_sel = self.wt_projects.iter().position(|p| p.current).unwrap_or(0);
                 }
             }
-            // "type path…" stays available.
-            Err(e) => self.toast(format!("herdr projects: {e}"), true),
+            Err(e) => {
+                self.wt_projects.clear();
+                self.wt_project_warnings.clear();
+                self.wt_project_error = Some(e);
+                self.wt_project_warning_scroll = 0;
+                self.picker_sel = 0;
+            }
         }
     }
 
-    fn on_repo_worktrees(
-        &mut self,
-        repo: String,
-        result: Result<Vec<herdr::RepoWorktree>, String>,
-    ) {
-        // Stale: another repo was picked, `w` was left, or already answered.
-        if !self.wt_worktrees_loading || repo != self.wt_repo || !self.in_worktree_flow() {
+    fn on_repo_worktrees(&mut self, token: u64, result: Result<Listing, String>) {
+        if !self.wt_worktrees_loading || token != self.wt_request_token || !self.in_worktree_flow()
+        {
             return;
         }
         self.wt_worktrees_loading = false;
         match result {
-            Ok(worktrees) => {
-                self.wt_worktrees = worktrees;
-                // The issue's branch already has a worktree: preselect reopening it.
+            Ok(listing) => {
+                let backend = listing.repository.backend;
+                self.wt_repo_name = listing.repository.name.clone();
+                self.wt_repo = listing.repository.root.clone();
+                self.wt_repository = Some(listing.repository);
+                self.wt_worktrees = listing.entries;
+                self.wt_default_name =
+                    self.wizard_issue
+                        .as_ref()
+                        .map_or_else(String::new, |issue| {
+                            if backend == Backend::Git {
+                                render_branch_name(&self.cfg.worktree.branch, issue)
+                            } else if self.cfg.worktree.jj.name.contains("{branch}") {
+                                String::new()
+                            } else {
+                                sanitize_jj_name(&fill_issue_placeholders(
+                                    &self.cfg.worktree.jj.name,
+                                    issue,
+                                ))
+                            }
+                        });
+                if backend == Backend::Jj && self.cfg.worktree.jj.name.contains("{branch}") {
+                    self.toast(
+                        "jj workspace name template uses {branch}; use {key} instead",
+                        true,
+                    );
+                }
                 if self.view == View::WorktreeListPicker {
-                    let branch = self.wt_default_branch.clone();
-                    self.return_to_worktree_list(Some(branch.as_str()));
+                    let name = self.wt_default_name.clone();
+                    self.picker_sel = self
+                        .wt_worktrees
+                        .iter()
+                        .position(|w| w.name == name)
+                        .map_or(0, |i| i + 1);
                 }
             }
-            // "+ new worktree" stays available.
-            Err(e) => self.toast(format!("worktrees: {e}"), true),
+            Err(e) => {
+                self.wt_error = Some(e.clone());
+                self.toast(format!("repository: {e}"), true);
+            }
         }
     }
 
-    /// Open (or create) the worktree without an agent; reported as `WorktreeOpened`.
-    fn open_worktree_only(&mut self, opts: herdr::WorktreeOpts) {
-        let repo = self.wt_repo.clone();
-        let focus = self.cfg.worktree.focus;
-        let branch = opts.branch.clone();
-        let tx = self.tx.clone();
-        let verb = if self.wt_existing {
+    fn open_worktree_only(&mut self, request: Request) {
+        let name = request.name().to_owned();
+        let backend = request.repository.backend;
+        let verb = if matches!(request.selection, Selection::Existing(_)) {
             "opening"
         } else {
             "creating"
         };
-        self.toast(format!("{verb} worktree {branch}…"), false);
+        self.toast(format!("{verb} {} {name}…", backend.label()), false);
+        let tx = self.tx.clone();
+        let focus = self.cfg.worktree.focus;
         std::thread::spawn(move || {
-            let result =
-                herdr::open_or_create_worktree(&repo, &opts, focus).map(|wt| wt.checkout_path);
-            let _ = tx.send(Resp::WorktreeOpened { branch, result });
+            let result = herdr::open_or_create_checkout(&request, focus).map(|wt| wt.checkout_path);
+            let _ = tx.send(Resp::WorktreeOpened {
+                name,
+                backend,
+                result,
+            });
         });
     }
 
-    /// Start `spawn` inside the worktree, wait until ready, send the Jira prompt.
-    fn start_worktree_agent(&mut self, spawn: SpawnAgent, wt: herdr::WorktreeOpts) {
+    fn start_worktree_agent(&mut self, spawn: SpawnAgent, request: Request) {
         if spawn.command.is_empty() {
             self.toast(format!("{}: empty command", spawn.name), true);
             return;
@@ -1224,13 +1356,13 @@ impl App {
         let submit = self.cfg.worktree.submit.unwrap_or(self.cfg.delegate.submit);
         let opts = StartAgentOpts {
             name: unique_agent_name(&key, &spawn.name),
-            cwd: self.wt_repo.clone(),
+            cwd: request.repository.root.clone(),
             argv: spawn.command,
             placement: self.cfg.delegate.placement.clone(),
             focus: self.cfg.worktree.focus,
             workspace_id: String::new(),
             tab_label: key.clone(),
-            worktree: Some(wt),
+            checkout: Some(Arc::new(request)),
         };
         self.prepare_handoff(HandoffDestination::New(opts), submit);
     }
@@ -1394,6 +1526,7 @@ impl App {
                 match result {
                     Err(e) => {
                         self.handoff = None;
+                        self.reset_existing_intent();
                         self.restore_handoff_origin();
                         self.handoff_error = Some(format!(
                             "Jira snapshot read failed: {e}; no agent or worktree started"
@@ -1465,15 +1598,58 @@ impl App {
                     }
                 }
             }
-            Resp::WorktreeOpened { branch, result } => match result {
+            Resp::WorktreeOpened {
+                name,
+                backend,
+                result,
+            } => match result {
                 Ok(path) => self.toast(
-                    format!("worktree {branch} ready: {}", short_home(&path)),
+                    format!("{} {name} ready: {}", backend.label(), short_home(&path)),
                     false,
                 ),
-                Err(e) => self.toast(format!("worktree {branch}: {e}"), true),
+                Err(e) => self.toast(format!("{} {name}: {e}", backend.label()), true),
             },
-            Resp::Projects(result) => self.on_projects(result),
-            Resp::RepoWorktrees { repo, result } => self.on_repo_worktrees(repo, result),
+            Resp::Projects { token, result } => self.on_projects(token, result),
+            Resp::RepoWorktrees { token, result } => self.on_repo_worktrees(token, result),
+            Resp::ExistingValidated { token, result } => {
+                if !self.wt_validating_path
+                    || token != self.wt_path_token
+                    || !matches!(
+                        self.view,
+                        View::WorktreeListPicker | View::WorktreeExistingPathInput
+                    )
+                    || self.wizard_issue.is_none()
+                {
+                    return;
+                }
+                let Some(original) = self.wt_pending_existing.take() else {
+                    return;
+                };
+                self.wt_validating_path = false;
+                match result {
+                    Ok((entry, warning))
+                        if entry.name == original.name
+                            && entry.path.is_some()
+                            && (original.path.is_none() || entry.path == original.path) =>
+                    {
+                        self.wt_name = entry.name.clone();
+                        self.wt_validated_existing = Some(entry.clone());
+                        self.wt_selected = Some(entry);
+                        self.wt_recovery_warning = warning;
+                        self.wt_recovery_scroll = 0;
+                        self.picker_sel = 0;
+                        self.view = if self.wt_recovery_warning.is_some() {
+                            View::WorktreeRecoveryConfirm
+                        } else {
+                            View::WorktreeAgentPicker
+                        };
+                    }
+                    Ok(_) => {
+                        self.toast("existing checkout identity changed; select it again", true)
+                    }
+                    Err(e) => self.toast(format!("existing checkout: {e}"), true),
+                }
+            }
             Resp::Children {
                 epic,
                 token,
@@ -1600,6 +1776,8 @@ impl App {
             View::WorktreeRepoInput => self.keys_worktree_repo_input(key),
             View::WorktreeListPicker => self.keys_worktree_list(key),
             View::WorktreeNameInput => self.keys_worktree_name(key),
+            View::WorktreeExistingPathInput => self.keys_worktree_existing_path(key),
+            View::WorktreeRecoveryConfirm => self.keys_worktree_recovery(key),
             View::WorktreeAgentPicker => self.keys_worktree_agent(key),
             View::SearchInput => self.keys_search(key),
             View::JqlInput => self.keys_jql(key),
@@ -2029,6 +2207,15 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.picker_sel = Self::move_sel(n, self.picker_sel, -1)
             }
+            KeyCode::PageDown => {
+                self.wt_project_warning_scroll = self
+                    .wt_project_warning_scroll
+                    .saturating_add(4)
+                    .min(self.wt_project_warning_scroll_max.get())
+            }
+            KeyCode::PageUp => {
+                self.wt_project_warning_scroll = self.wt_project_warning_scroll.saturating_sub(4)
+            }
             KeyCode::Char('/') | KeyCode::Char('e') => self.open_worktree_repo_input(),
             KeyCode::Enter => self.pick_worktree_project_row(self.picker_sel),
             _ => {}
@@ -2040,10 +2227,7 @@ impl App {
             self.open_worktree_repo_input();
             return;
         };
-        match resolve_cwd(&project.root) {
-            Ok(repo) => self.open_worktree_list(repo, project.name),
-            Err(e) => self.toast(format!("repo: {e}"), true),
-        }
+        self.open_worktree_list(project.root, project.name);
     }
 
     fn keys_worktree_repo_input(&mut self, key: KeyEvent) {
@@ -2053,13 +2237,7 @@ impl App {
                 self.picker_sel = self.wt_projects.len();
                 self.view = View::WorktreeProjectPicker;
             }
-            KeyCode::Enter => match resolve_cwd(&self.cwd_input) {
-                Ok(repo) => {
-                    let name = dir_name(&repo);
-                    self.open_worktree_list(repo, name);
-                }
-                Err(e) => self.toast(format!("repo: {e}"), true),
-            },
+            KeyCode::Enter => self.open_worktree_list(self.cwd_input.clone(), String::new()),
             KeyCode::Backspace => {
                 self.cwd_input.pop();
             }
@@ -2073,6 +2251,17 @@ impl App {
 
     /// Row 0 = "+ new worktree"; rows 1.. = the repo's existing worktrees.
     fn keys_worktree_list(&mut self, key: KeyEvent) {
+        if self.wt_validating_path {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.reset_existing_intent();
+                if self.wt_project_asked {
+                    self.return_to_project_picker();
+                } else {
+                    self.return_to_list();
+                }
+            }
+            return;
+        }
         let n = self.wt_worktrees.len() + 1;
         if let Some(idx) = Self::picker_number(&key, n) {
             self.pick_worktree_list_row(idx);
@@ -2098,31 +2287,46 @@ impl App {
     }
 
     fn pick_worktree_list_row(&mut self, row: usize) {
+        if self.wt_worktrees_loading || self.wt_repository.is_none() || self.wt_error.is_some() {
+            return;
+        }
         let Some(idx) = row.checked_sub(1) else {
-            self.wt_existing = false;
             self.open_worktree_name_input();
             return;
         };
-        let Some(wt) = self.wt_worktrees.get(idx) else {
+        let Some(entry) = self.wt_worktrees.get(idx).cloned() else {
             return;
         };
-        // `open_or_create_worktree` reopens an existing branch's worktree.
-        self.wt_branch = wt.branch.clone();
-        self.wt_existing = true;
+        self.wt_name = entry.name.clone();
+        self.wt_selected = Some(entry.clone());
         self.picker_sel = 0;
-        self.view = View::WorktreeAgentPicker;
+        if let Some(path) = entry.path.clone() {
+            self.validate_worktree_existing(entry, path);
+        } else {
+            self.reset_existing_intent();
+            self.wt_existing_path_input.clear();
+            self.view = View::WorktreeExistingPathInput;
+        }
     }
 
     fn keys_worktree_name(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.return_to_worktree_list(None),
             KeyCode::Enter => {
-                let branch = sanitize_branch_name(&self.wt_name_input);
-                if branch.is_empty() {
-                    self.toast("worktree name is not a valid git branch name", true);
+                let Some(repo) = self.wt_repository.as_ref() else {
+                    return;
+                };
+                let name = if repo.backend == Backend::Git {
+                    sanitize_branch_name(&self.wt_name_input)
+                } else {
+                    sanitize_jj_name(&self.wt_name_input)
+                };
+                if name.is_empty() {
+                    self.toast(format!("invalid {} name", repo.backend.label()), true);
                     return;
                 }
-                self.wt_branch = branch;
+                self.wt_name = name;
+                self.wt_selected = None;
                 self.picker_sel = 0;
                 self.view = View::WorktreeAgentPicker;
             }
@@ -2137,6 +2341,71 @@ impl App {
         }
     }
 
+    fn keys_worktree_existing_path(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                let selected = self.wt_selected.clone();
+                self.return_to_worktree_list(selected.as_ref());
+            }
+            KeyCode::Enter if !self.wt_validating_path => {
+                let Some(entry) = self.wt_selected.clone() else {
+                    return;
+                };
+                let path = match resolve_cwd(&self.wt_existing_path_input) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        self.toast(format!("jj workspace path: {e}"), true);
+                        return;
+                    }
+                };
+                self.validate_worktree_existing(entry, path);
+            }
+            KeyCode::Backspace if !self.wt_validating_path => {
+                self.wt_existing_path_input.pop();
+            }
+            KeyCode::Char('u')
+                if !self.wt_validating_path && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.wt_existing_path_input.clear()
+            }
+            KeyCode::Char(c) if !self.wt_validating_path => self.wt_existing_path_input.push(c),
+            _ => {}
+        }
+    }
+
+    fn keys_worktree_recovery(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let selected = self.wt_selected.clone();
+                self.return_to_worktree_list(selected.as_ref());
+            }
+            // Deliberately not Enter or a numbered picker key.
+            KeyCode::Char('I')
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if self.wt_recovery_warning.is_some()
+                    && self.wt_selected.as_ref() == self.wt_validated_existing.as_ref()
+                {
+                    self.wt_approved_existing = self.wt_validated_existing.clone();
+                    self.picker_sel = 0;
+                    self.view = View::WorktreeAgentPicker;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                self.wt_recovery_scroll = self
+                    .wt_recovery_scroll
+                    .saturating_add(if key.code == KeyCode::PageDown { 8 } else { 1 })
+                    .min(self.wt_recovery_scroll_max.get());
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                self.wt_recovery_scroll = self
+                    .wt_recovery_scroll
+                    .saturating_sub(if key.code == KeyCode::PageUp { 8 } else { 1 });
+            }
+            _ => {}
+        }
+    }
+
     /// Row 0 = no agent (just open the worktree); rows 1.. = `[delegate].agents`.
     fn keys_worktree_agent(&mut self, key: KeyEvent) {
         let n = self.cfg.delegate.agents.len() + 1;
@@ -2146,9 +2415,8 @@ impl App {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                if self.wt_existing {
-                    let branch = self.wt_branch.clone();
-                    self.return_to_worktree_list(Some(branch.as_str()));
+                if let Some(selected) = self.wt_selected.clone() {
+                    self.return_to_worktree_list(Some(&selected));
                 } else {
                     self.view = View::WorktreeNameInput;
                 }
@@ -2172,17 +2440,43 @@ impl App {
                 None => return,
             },
         };
-        let Some(issue) = self.wizard_issue.as_ref() else {
+        if let Some(selected) = self.wt_selected.as_ref() {
+            if self.wt_validated_existing.as_ref() != Some(selected)
+                || (self.wt_recovery_warning.is_some()
+                    && self.wt_approved_existing.as_ref() != Some(selected))
+            {
+                self.toast(
+                    "validate and inspect this existing checkout before opening it",
+                    true,
+                );
+                return;
+            }
+        }
+        let (Some(issue), Some(repo)) = (self.wizard_issue.as_ref(), self.wt_repository.as_ref())
+        else {
             return;
         };
-        let opts = worktree_opts(&self.cfg, issue, &self.wt_branch);
+        let request = match worktree_request(
+            &self.cfg,
+            issue,
+            repo,
+            self.wt_selected.as_ref(),
+            self.wt_approved_existing.as_ref(),
+            &self.wt_name,
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                self.toast(e, true);
+                return;
+            }
+        };
         match spawn {
             None => {
                 self.return_to_list();
-                self.open_worktree_only(opts);
+                self.open_worktree_only(request);
             }
             Some(spawn) => {
-                self.start_worktree_agent(spawn, opts);
+                self.start_worktree_agent(spawn, request);
                 if self.handoff.is_some() {
                     self.view = View::List;
                 }
@@ -2601,170 +2895,437 @@ mod tests {
         assert_eq!(project_key("A-B-12"), "A-B");
     }
 
-    fn project(name: &str, current: bool) -> herdr::RepoProject {
+    fn project(name: &str, current: bool, backend: Backend) -> herdr::RepoProject {
         herdr::RepoProject {
             name: name.into(),
             root: temp_dir(),
-            repo_key: format!("/x/{name}/.git"),
+            repo_key: format!("{name}-store"),
+            backend,
             open_worktrees: 0,
             current,
         }
     }
 
-    fn worktree(branch: &str) -> herdr::RepoWorktree {
-        herdr::RepoWorktree {
-            branch: branch.into(),
-            path: format!("/x/{branch}"),
-            open: false,
-            is_main: false,
+    fn listing(backend: Backend, entries: Vec<Entry>) -> Listing {
+        Listing {
+            repository: Repository {
+                backend,
+                key: format!("{backend:?}-store"),
+                root: temp_dir(),
+                name: "checkout".into(),
+            },
+            entries,
         }
     }
 
+    fn checkout_entry(name: &str, path: Option<&str>) -> Entry {
+        Entry {
+            name: name.into(),
+            path: path.map(str::to_owned),
+            open: false,
+            is_source: false,
+        }
+    }
+
+    fn resolve_wizard(app: &mut App, backend: Backend, entries: Vec<Entry>) {
+        let token = app.wt_request_token;
+        app.on_resp(Resp::RepoWorktrees {
+            token,
+            result: Ok(listing(backend, entries)),
+        });
+    }
+
     #[test]
-    fn worktree_with_configured_repo_lists_its_worktrees() {
+    fn configured_repo_resolves_backend_before_name_or_creation() {
         let mut app = list_app();
         app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(app.view, View::WorktreeListPicker);
-        assert_eq!(app.wt_repo, resolve_cwd(&temp_dir()).unwrap());
-        assert!(!app.wt_project_asked);
-        // Row 0 = "+ new worktree", prefilled from `[worktree].branch`.
+        assert!(app.wt_worktrees_loading);
+        assert!(app.wt_default_name.is_empty());
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeNameInput);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        resolve_wizard(&mut app, Backend::Jj, vec![]);
+        assert_eq!(app.wt_default_name, "PROJ-7");
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.wt_name_input, "PROJ-7");
+        app.wt_name_input = "feature work".into();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.wt_name, "feature work");
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::WorktreeNameInput);
+        assert_eq!(app.wt_name_input, "feature work");
     }
 
     #[test]
-    fn worktree_without_repo_asks_for_a_herdr_project() {
+    fn project_picker_and_manual_path_resolve_with_preference() {
         let mut app = list_app();
         press(&mut app, KeyCode::Char('w'));
-        assert_eq!(app.view, View::WorktreeProjectPicker);
-        assert!(app.wt_project_asked);
-        app.on_resp(Resp::Projects(Ok(vec![
-            project("jira", true),
-            project("web", false),
-        ])));
-        assert_eq!(app.wt_projects.len(), 2);
-        assert_eq!(app.picker_sel, 0);
-
+        let token = app.wt_projects_token;
+        app.on_resp(Resp::Projects {
+            token,
+            result: Ok(herdr::ProjectInventory {
+                projects: vec![
+                    project("jira", true, Backend::Jj),
+                    project("web", false, Backend::Git),
+                ],
+                warnings: vec![],
+            }),
+        });
         press(&mut app, KeyCode::Char('2'));
         assert_eq!(app.view, View::WorktreeListPicker);
         assert_eq!(app.wt_repo_name, "web");
-        assert_eq!(app.wt_repo, resolve_cwd(&temp_dir()).unwrap());
-    }
-
-    #[test]
-    fn existing_worktree_of_the_issue_branch_is_preselected_and_reopened() {
-        let mut app = list_app();
-        press(&mut app, KeyCode::Char('w'));
-        app.on_resp(Resp::Projects(Ok(vec![project("jira", true)])));
-        press(&mut app, KeyCode::Enter);
-        let repo = app.wt_repo.clone();
-        app.on_resp(Resp::RepoWorktrees {
-            repo,
-            result: Ok(vec![worktree("main"), worktree("PROJ-7")]),
-        });
-        assert_eq!(app.picker_sel, 2);
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeAgentPicker);
-        assert_eq!(app.wt_branch, "PROJ-7");
-
-        // Esc: agent picker -> worktree list (same row) -> project picker -> List.
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::WorktreeListPicker);
-        assert_eq!(app.picker_sel, 2);
+        resolve_wizard(&mut app, Backend::Git, vec![]);
+        assert_eq!(app.wt_repository.as_ref().unwrap().backend, Backend::Git);
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, View::WorktreeProjectPicker);
-        assert_eq!(app.picker_sel, 0);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::List);
-    }
-
-    #[test]
-    fn stale_or_failed_herdr_answers_keep_the_flow_usable() {
-        let mut app = list_app();
-        app.cfg.worktree.repo = temp_dir();
-        press(&mut app, KeyCode::Char('w'));
-        // Another repo's answer is ignored.
-        app.on_resp(Resp::RepoWorktrees {
-            repo: "/elsewhere".into(),
-            result: Ok(vec![worktree("x")]),
-        });
-        assert!(app.wt_worktrees.is_empty());
-        assert!(app.wt_worktrees_loading);
-        // A failed listing still offers "+ new worktree".
-        let repo = app.wt_repo.clone();
-        app.on_resp(Resp::RepoWorktrees {
-            repo,
-            result: Err("boom".into()),
-        });
-        assert!(matches!(&app.toast, Some((_, true, _))));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeNameInput);
-
-        // Projects arriving after `w` was left are dropped.
-        let mut app = list_app();
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Esc);
-        app.on_resp(Resp::Projects(Ok(vec![project("jira", true)])));
-        assert!(app.wt_projects.is_empty());
-        assert_eq!(app.view, View::List);
-    }
-
-    #[test]
-    fn worktree_name_must_sanitize_to_a_branch() {
-        let mut app = list_app();
-        app.cfg.worktree.repo = temp_dir();
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Enter);
-        app.wt_name_input = "@".into();
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeNameInput);
-        assert!(matches!(&app.toast, Some((_, true, _))));
-
-        app.wt_name_input = "feature/x y".into();
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeAgentPicker);
-        assert_eq!(app.wt_branch, "feature/x-y");
-    }
-
-    #[test]
-    fn worktree_esc_walks_back_one_step() {
-        // Repo from config: agent picker -> name input (edit kept) -> list -> List.
-        let mut app = list_app();
-        app.cfg.worktree.repos.insert("PROJ".into(), temp_dir());
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Enter);
-        app.wt_name_input = "feature/x y".into();
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeAgentPicker);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::WorktreeNameInput);
-        assert_eq!(app.wt_name_input, "feature/x y");
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::WorktreeListPicker);
-        assert_eq!(app.picker_sel, 0);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::List);
-
-        // Typed path: name input -> list -> project picker ("type path…") -> path input.
-        let mut app = list_app();
-        press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('/'));
-        assert_eq!(app.view, View::WorktreeRepoInput);
         app.cwd_input = temp_dir();
         press(&mut app, KeyCode::Enter);
+        assert!(app.wt_worktrees_loading);
+        resolve_wizard(&mut app, Backend::Jj, vec![]);
+        assert_eq!(app.wt_repository.as_ref().unwrap().backend, Backend::Jj);
+    }
+
+    #[test]
+    fn project_discovery_keeps_healthy_rows_and_persistent_candidate_diagnostics() {
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('w'));
+        let first = app.wt_projects_token;
+        app.on_resp(Resp::Projects {
+            token: first,
+            result: Ok(herdr::ProjectInventory {
+                projects: vec![project("healthy-git", true, Backend::Git)],
+                warnings: vec!["space bad-jj · /repos/bad-jj · cannot run jj".into()],
+            }),
+        });
+        assert_eq!(app.wt_projects.len(), 1);
+        assert_eq!(app.picker_sel, 0);
+        app.toast = None;
+        let rendered = screen(&app);
+        assert!(rendered.contains("healthy-git"));
+        assert!(rendered.contains("bad-jj"));
+        assert!(!rendered.contains("no Git or jj projects open"));
+        press(&mut app, KeyCode::Char('1'));
+        resolve_wizard(&mut app, Backend::Git, vec![]);
+        press(&mut app, KeyCode::Esc);
+        assert!(screen(&app).contains("bad-jj"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('w'));
+        let second = app.wt_projects_token;
+        app.on_resp(Resp::Projects {
+            token: first,
+            result: Err("stale discovery".into()),
+        });
+        assert!(app.wt_projects_loading);
+        app.on_resp(Resp::Projects {
+            token: second,
+            result: Err("space broken · /repos/broken · missing jj".into()),
+        });
+        assert!(app.wt_projects.is_empty());
+        assert!(screen(&app).contains("project discovery failed"));
+        assert!(screen(&app).contains("/repos/broken"));
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Esc);
+        assert!(screen(&app).contains("/repos/broken"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('w'));
+        app.on_resp(Resp::Projects {
+            token: app.wt_projects_token,
+            result: Ok(herdr::ProjectInventory {
+                projects: vec![],
+                warnings: vec![],
+            }),
+        });
+        assert!(screen(&app).contains("no Git or jj projects open"));
+        assert!(!screen(&app).contains("/repos/broken"));
+    }
+
+    #[test]
+    fn known_existing_requires_async_identity_and_request_specific_manual_approval() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        let existing = checkout_entry("dev", Some("/work/actual-dev"));
+        resolve_wizard(&mut app, Backend::Jj, vec![existing.clone()]);
+        press(&mut app, KeyCode::Char('2'));
+        assert!(app.wt_validating_path);
         assert_eq!(app.view, View::WorktreeListPicker);
+        assert!(screen(&app).contains("validating native identity"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        let corrupt_token = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token: corrupt_token,
+            result: Err("receipt version corrupt".into()),
+        });
+        assert!(app.wt_validated_existing.is_none());
+        press(&mut app, KeyCode::Char('I'));
+        assert_eq!(app.view, View::WorktreeListPicker);
+        press(&mut app, KeyCode::Char('2'));
+        let token = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token,
+            result: Ok((
+                checkout_entry("dev", Some("/work/swapped")),
+                Some("Pending".into()),
+            )),
+        });
+        assert_eq!(app.view, View::WorktreeListPicker);
+        press(&mut app, KeyCode::Char('2'));
+        let token = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token,
+            result: Ok((existing.clone(), Some("Pending native jj creation".into()))),
+        });
+        assert_eq!(app.view, View::WorktreeRecoveryConfirm);
+        let rendered = screen(&app);
+        assert!(rendered.contains("/work/actual-dev"));
+        assert!(rendered.contains("jj --ignore-working-copy"));
+        assert!(rendered.contains("Pending"));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.view, View::WorktreeRecoveryConfirm);
+        assert!(app.wt_approved_existing.is_none());
+        press(&mut app, KeyCode::Char('I'));
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        assert!(screen(&app).contains("approved for this Existing request only"));
+        app.issues = vec![named_issue("PROJ-8")];
+        press(&mut app, KeyCode::Char('2'));
+        let op = app.handoff.as_ref().unwrap();
+        assert_eq!(op.key, "PROJ-7");
+        let HandoffDestination::New(opts) = &op.destination else {
+            panic!("worktree agent must use a new pane");
+        };
+        let checkout = opts.checkout.as_ref().unwrap();
+        assert!(checkout.recovery_acknowledged);
+        assert!(matches!(&checkout.selection, Selection::Existing(entry) if entry == &existing));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.handoff.is_none());
+        assert!(app.wt_approved_existing.is_none());
+    }
+
+    #[test]
+    fn cancel_and_new_selection_revoke_recovery_consent_and_stale_validation() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        let entry = checkout_entry("legacy", None);
+        resolve_wizard(&mut app, Backend::Jj, vec![entry.clone()]);
+        press(&mut app, KeyCode::Char('2'));
+        app.wt_existing_path_input = temp_dir();
+        press(&mut app, KeyCode::Enter);
+        let stale = app.wt_path_token;
+        press(&mut app, KeyCode::Esc);
+        app.on_resp(Resp::ExistingValidated {
+            token: stale,
+            result: Ok((
+                checkout_entry("legacy", Some("/work/legacy")),
+                Some("Failed".into()),
+            )),
+        });
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert!(app.wt_approved_existing.is_none());
+        press(&mut app, KeyCode::Char('2'));
+        app.wt_existing_path_input = temp_dir();
+        press(&mut app, KeyCode::Enter);
+        let selected = checkout_entry("legacy", Some("/work/legacy"));
+        app.on_resp(Resp::ExistingValidated {
+            token: app.wt_path_token,
+            result: Ok((selected.clone(), Some("Failed native jj creation".into()))),
+        });
+        assert_eq!(app.view, View::WorktreeRecoveryConfirm);
+        press(&mut app, KeyCode::Char('I'));
+        assert_eq!(app.wt_approved_existing.as_ref(), Some(&selected));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.wt_approved_existing.is_none());
+        assert!(app.wt_validated_existing.is_none());
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        let request = worktree_request(
+            &app.cfg,
+            &test_issue(),
+            app.wt_repository.as_ref().unwrap(),
+            app.wt_selected.as_ref(),
+            app.wt_approved_existing.as_ref(),
+            &app.wt_name,
+        )
+        .unwrap();
+        assert!(!request.recovery_acknowledged);
+        assert!(matches!(request.selection, Selection::New { .. }));
+    }
+
+    #[test]
+    fn existing_selection_preserves_exact_identity_and_ignores_new_templates() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        app.cfg.worktree.base = "wrong-base".into();
+        app.cfg.worktree.path = "wrong-path".into();
+        press(&mut app, KeyCode::Char('w'));
+        let existing = checkout_entry("PROJ-7", Some("/x/existing"));
+        resolve_wizard(
+            &mut app,
+            Backend::Git,
+            vec![checkout_entry("main", Some("/x/main")), existing.clone()],
+        );
+        assert_eq!(app.picker_sel, 2);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.wt_selected.as_ref(), Some(&existing));
+        assert!(app.wt_validating_path);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        let first = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token: first,
+            result: Ok((existing.clone(), None)),
+        });
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.picker_sel, 2);
+        press(&mut app, KeyCode::Enter);
+        let second = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token: second,
+            result: Ok((existing.clone(), None)),
+        });
+        let request = worktree_request(
+            &app.cfg,
+            &test_issue(),
+            app.wt_repository.as_ref().unwrap(),
+            app.wt_selected.as_ref(),
+            None,
+            &app.wt_name,
+        )
+        .unwrap();
+        assert!(matches!(request.selection, Selection::Existing(e) if e == existing));
+    }
+
+    #[test]
+    fn failed_and_stale_listings_cannot_create_or_override_newer_selection() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        let stale = app.wt_request_token;
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('w'));
+        app.on_resp(Resp::RepoWorktrees {
+            token: stale,
+            result: Ok(listing(Backend::Git, vec![])),
+        });
+        assert!(app.wt_worktrees_loading);
+        let token = app.wt_request_token;
+        app.on_resp(Resp::RepoWorktrees {
+            token,
+            result: Err("broken .jj metadata".into()),
+        });
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::WorktreeListPicker);
+        assert!(screen(&app).contains("repository unavailable"));
+    }
+
+    #[test]
+    fn unknown_jj_path_requires_async_identity_validation_and_can_cancel() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        resolve_wizard(&mut app, Backend::Jj, vec![checkout_entry("dev", None)]);
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.view, View::WorktreeExistingPathInput);
+        app.wt_existing_path_input = temp_dir();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.wt_validating_path);
+        let token = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token,
+            result: Err("wrong workspace".into()),
+        });
+        assert_eq!(app.view, View::WorktreeExistingPathInput);
+        assert!(!app.wt_validating_path);
+        press(&mut app, KeyCode::Enter);
+        let token = app.wt_path_token;
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.picker_sel, 1);
+        app.on_resp(Resp::ExistingValidated {
+            token,
+            result: Ok((checkout_entry("dev", Some("/x/dev")), None)),
+        });
+        assert_eq!(app.view, View::WorktreeListPicker);
+        press(&mut app, KeyCode::Enter);
+        app.wt_existing_path_input = temp_dir();
+        press(&mut app, KeyCode::Enter);
+        let token = app.wt_path_token;
+        let validated = checkout_entry("dev", Some("/x/dev"));
+        app.on_resp(Resp::ExistingValidated {
+            token,
+            result: Ok((validated.clone(), None)),
+        });
+        assert_eq!(app.wt_selected.as_ref(), Some(&validated));
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.picker_sel, 1);
+    }
+
+    #[test]
+    fn jj_name_validation_does_not_apply_git_branch_rules_to_existing() {
+        let mut app = list_app();
+        app.cfg.worktree.repo = temp_dir();
+        press(&mut app, KeyCode::Char('w'));
+        resolve_wizard(
+            &mut app,
+            Backend::Jj,
+            vec![checkout_entry("legacy~^", Some("/x/legacy"))],
+        );
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.wt_name, "legacy~^");
+        assert_eq!(app.wt_selected.as_ref().unwrap().name, "legacy~^");
+        let token = app.wt_path_token;
+        app.on_resp(Resp::ExistingValidated {
+            token,
+            result: Ok((checkout_entry("legacy~^", Some("/x/legacy")), None)),
+        });
+        assert_eq!(app.view, View::WorktreeAgentPicker);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('1'));
+        app.wt_name_input = "feature work".into();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.wt_name, "feature work");
+        press(&mut app, KeyCode::Esc);
+        app.wt_name_input = "invalid/workspace".into();
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.view, View::WorktreeNameInput);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::WorktreeListPicker);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.view, View::WorktreeProjectPicker);
-        assert_eq!(app.picker_sel, app.wt_projects.len());
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeRepoInput);
     }
+
+    #[test]
+    fn backend_templates_are_separate_and_jj_rejects_git_only_placeholder() {
+        let mut app = list_app();
+        app.cfg.worktree.base = "  release/{key}  ".into();
+        app.cfg.worktree.path = "/tmp/{branch}-{name}".into();
+        app.cfg.worktree.jj.path = "/tmp/{name}".into();
+        app.cfg.worktree.jj.base = "root()".into();
+        let git = listing(Backend::Git, vec![]).repository;
+        let jj = listing(Backend::Jj, vec![]).repository;
+        let git_request =
+            worktree_request(&app.cfg, &test_issue(), &git, None, None, "feature").unwrap();
+        assert!(matches!(
+            git_request.selection,
+            Selection::New { path, base, .. }
+                if path == "/tmp/feature-feature" && base == "release/{key}"
+        ));
+        assert!(!git_request.recovery_acknowledged);
+        let jj_request =
+            worktree_request(&app.cfg, &test_issue(), &jj, None, None, "feature").unwrap();
+        assert!(
+            matches!(jj_request.selection, Selection::New { path, base, .. } if path == "/tmp/feature" && base == "root()")
+        );
+        app.cfg.worktree.label = "{branch}".into();
+        assert!(
+            worktree_request(&app.cfg, &test_issue(), &jj, None, None, "feature")
+                .unwrap_err()
+                .contains("{name}")
+        );
+    }
+
     fn named_issue(key: &str) -> Issue {
         let mut issue = test_issue();
         issue.key = key.into();
@@ -2785,39 +3346,30 @@ mod tests {
     }
 
     #[test]
-    fn wizard_headings_follow_captured_issue_across_list_replacement() {
+    fn captured_issue_is_used_for_checkout_handoff_after_list_replacement() {
         let mut app = list_app();
-        app.issues.push(named_issue("PROJ-8"));
-        press(&mut app, KeyCode::Char('d'));
-        assert_eq!(app.wizard_issue_key(), Some("PROJ-7"));
+        press(&mut app, KeyCode::Char('w'));
         app.issues = vec![named_issue("PROJ-8")];
-        app.selected = 0;
-        for (view, heading) in [
-            (View::AgentPicker, "delegate PROJ-7 to agent"),
-            (View::NewAgentTypePicker, "start agent for PROJ-7"),
-            (View::WorktreeProjectPicker, "worktree for PROJ-7 — project"),
-            (View::WorktreeRepoInput, "worktree for PROJ-7 — repo path"),
-            (View::WorktreeListPicker, "worktree for PROJ-7 —"),
-            (View::WorktreeNameInput, "new worktree for PROJ-7"),
-            (
-                View::WorktreeAgentPicker,
-                "worktree for PROJ-7 — start an agent",
-            ),
-        ] {
-            app.view = view;
-            let rendered = screen(&app);
-            assert!(rendered.contains(heading), "{view:?}: {rendered}");
-            assert!(!rendered.contains("worktree for PROJ-8"), "{rendered}");
-        }
-        app.view = View::WorktreeAgentPicker;
-        app.wt_repo = temp_dir();
-        app.wt_branch = "PROJ-7".into();
+        app.on_resp(Resp::Projects {
+            token: app.wt_projects_token,
+            result: Ok(herdr::ProjectInventory {
+                projects: vec![project("checkout", true, Backend::Jj)],
+                warnings: vec![],
+            }),
+        });
+        press(&mut app, KeyCode::Enter);
+        resolve_wizard(&mut app, Backend::Jj, vec![]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.wt_name_input, "PROJ-7");
+        press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('2'));
-        assert_eq!(app.handoff.as_ref().unwrap().key, "PROJ-7");
-        let HandoffDestination::New(opts) = &app.handoff.as_ref().unwrap().destination else {
-            panic!("worktree agent must start a new pane");
+        let op = app.handoff.as_ref().unwrap();
+        assert_eq!(op.key, "PROJ-7");
+        let HandoffDestination::New(opts) = &op.destination else {
+            panic!("checkout handoff must start a new pane");
         };
         assert_eq!(opts.tab_label, "PROJ-7");
+        assert_eq!(opts.checkout.as_ref().unwrap().name(), "PROJ-7");
     }
 
     #[test]
@@ -2839,31 +3391,7 @@ mod tests {
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(app.wizard_issue_key(), Some("PROJ-8"));
         assert!(screen(&app).contains("worktree for PROJ-8"));
-        assert_eq!(app.wt_default_branch, "PROJ-8");
-    }
-
-    #[test]
-    fn worktree_picker_and_operation_keep_its_original_issue_after_page_change() {
-        let mut app = list_app();
-        press(&mut app, KeyCode::Char('w'));
-        assert_eq!(app.view, View::WorktreeProjectPicker);
-        app.issues = vec![named_issue("PROJ-8")];
-        assert!(screen(&app).contains("worktree for PROJ-7 — project"));
-        app.on_resp(Resp::Projects(Ok(vec![project("checkout", true)])));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.view, View::WorktreeListPicker);
-        assert!(screen(&app).contains("worktree for PROJ-7"));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.wt_name_input, "PROJ-7");
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Char('2'));
-        let op = app.handoff.as_ref().unwrap();
-        assert_eq!(op.key, "PROJ-7");
-        let HandoffDestination::New(opts) = &op.destination else {
-            panic!("worktree agent must use the frozen issue");
-        };
-        assert_eq!(opts.tab_label, "PROJ-7");
-        assert_eq!(opts.worktree.as_ref().unwrap().branch, "PROJ-7");
+        assert!(app.wt_default_name.is_empty()); // backend not resolved yet
     }
 
     #[test]
@@ -2911,6 +3439,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('w'));
         assert_eq!(app.view, View::WorktreeListPicker);
+        resolve_wizard(&mut app, Backend::Jj, vec![]);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('2'));
@@ -3693,9 +4222,22 @@ pub fn render_branch_name(template: &str, issue: &Issue) -> String {
     sanitize_branch_name(&fill_issue_placeholders(template, issue))
 }
 
-/// Fill a worktree path/label template: {key} {type} {slug} {branch}.
-fn fill_worktree_template(template: &str, issue: &Issue, branch: &str) -> String {
-    fill_issue_placeholders(template, issue).replace("{branch}", branch)
+/// Fill a checkout path/label template. `{branch}` is only defined for Git.
+fn fill_worktree_template(
+    template: &str,
+    issue: &Issue,
+    backend: Backend,
+    name: &str,
+) -> Result<String, String> {
+    if backend == Backend::Jj && template.contains("{branch}") {
+        return Err("jj workspace template uses {branch}; use {name} instead".into());
+    }
+    let rendered = fill_issue_placeholders(template, issue).replace("{name}", name);
+    Ok(if backend == Backend::Git {
+        rendered.replace("{branch}", name)
+    } else {
+        rendered
+    })
 }
 
 fn fill_issue_placeholders(template: &str, issue: &Issue) -> String {
@@ -3771,6 +4313,23 @@ fn sanitize_branch_name(raw: &str) -> String {
     }
 }
 
+/// jj workspace names are not Git refs. Keep the user's exact valid name, and
+/// reject names that cannot be a single native workspace/path component.
+fn sanitize_jj_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.starts_with('-')
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+    {
+        String::new()
+    } else {
+        name.to_string()
+    }
+}
+
 fn collapse_runs(s: &str, ch: char) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -3818,21 +4377,58 @@ fn spawn_herdr(work: impl FnOnce() + Send + 'static) {
     std::thread::spawn(work);
 }
 
-/// `herdr worktree` options for `issue` on `branch` from `[worktree]`.
-fn worktree_opts(cfg: &Config, issue: &Issue, branch: &str) -> herdr::WorktreeOpts {
+fn worktree_request(
+    cfg: &Config,
+    issue: &Issue,
+    repository: &Repository,
+    selected: Option<&Entry>,
+    approved_existing: Option<&Entry>,
+    name: &str,
+) -> Result<Request, String> {
     let wcfg = &cfg.worktree;
-    let path = if wcfg.path.trim().is_empty() {
-        String::new()
+    let backend = repository.backend;
+    let label = fill_worktree_template(wcfg.label.trim(), issue, backend, name)?;
+    let recovery_acknowledged = selected.is_some_and(|entry| Some(entry) == approved_existing);
+    let selection = if let Some(entry) = selected {
+        if entry.path.is_none() {
+            return Err(format!(
+                "path for existing jj workspace {} must be validated",
+                entry.name
+            ));
+        }
+        Selection::Existing(entry.clone())
     } else {
-        herdr::expand_path(&fill_worktree_template(wcfg.path.trim(), issue, branch))
+        if backend == Backend::Jj && wcfg.jj.name.contains("{branch}") {
+            return Err("jj workspace name template uses {branch}; use {key} instead".into());
+        }
+        let (base, path) = if backend == Backend::Git {
+            (wcfg.base.trim(), wcfg.path.trim())
+        } else {
+            (wcfg.jj.base.trim(), wcfg.jj.path.trim())
+        };
+        let base = if backend == Backend::Git {
+            base.to_string()
+        } else {
+            fill_worktree_template(base, issue, backend, name)?
+        };
+        let path = fill_worktree_template(path, issue, backend, name)?;
+        Selection::New {
+            name: name.to_string(),
+            base,
+            path: if path.is_empty() {
+                path
+            } else {
+                herdr::expand_path(&path)
+            },
+        }
     };
-    herdr::WorktreeOpts {
-        branch: branch.to_string(),
-        base: wcfg.base.trim().to_string(),
-        path,
-        label: fill_worktree_template(wcfg.label.trim(), issue, branch),
+    Ok(Request {
+        repository: repository.clone(),
+        selection,
+        label,
         trust_repository: wcfg.trust_repository,
-    }
+        recovery_acknowledged,
+    })
 }
 
 /// Build cwd options: configured default, unique cwds from running agents,

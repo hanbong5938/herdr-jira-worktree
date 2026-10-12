@@ -1,6 +1,6 @@
 # herdr-plugin.toml — manifest for the han.jira-worktree plugin.
-# Find a Jira issue via JQL, then optionally open a git worktree or start an
-# agent. This is not a full Jira replacement.
+# Find a Jira issue via JQL, then optionally open a Git worktree or native jj
+# workspace or start an agent. This is not a full Jira replacement.
 #
 # Configuration is outside the plugin checkout. After a remote install, create
 # config.toml in `herdr plugin config-dir han.jira-worktree` using README's
@@ -8,8 +8,8 @@
 
 id = "han.jira-worktree"
 name = "Jira Worktree"
-version = "0.3.2"
-description = "Jira TUI in a herdr pane: JQL filters, search, comments, manual status transitions, and reviewed bounded Jira-context handoff to running or newly started agents, optionally in a new or existing git worktree per herdr project."
+version = "0.4.0"
+description = "Jira TUI in a herdr pane: JQL filters, search, comments, manual status transitions, and reviewed bounded Jira-context handoff to agents, optionally in a Git worktree or native jj workspace."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 

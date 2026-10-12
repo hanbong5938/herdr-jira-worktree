@@ -3,11 +3,10 @@
 [English](README.md) | **한국어**
 
 Vitalii Rudnykh의 [a2u/herdr-jira](https://github.com/a2u/herdr-jira)를 포크한
-플러그인입니다. Jira 이슈를 herdr 프로젝트별 새 git worktree 또는 기존
-worktree로 여는 `w` 키와, 이슈 상세 화면의 댓글 보기가 추가되어 있습니다.
+플러그인입니다. Jira 이슈를 Git worktree 또는 네이티브 jj workspace로 여는 `w` 키와, 이슈 상세 화면의 댓글 보기가 추가되어 있습니다.
 버전은 업스트림과 별개로 관리합니다(이 포크는 0.1.0부터 시작).
 
-[herdr](https://herdr.dev) 패널에서 Jira 이슈를 찾아 git worktree로 이어 주는
+[herdr](https://herdr.dev) 패널에서 Jira 이슈를 찾아 Git worktree 또는 jj workspace로 이어 주는
 도구입니다. Jira 전체를 대체하지 않습니다. JQL 필터와 검색으로 이슈를 찾고
 상세/댓글을 읽은 뒤, 선택적으로 worktree를 열거나 에이전트를 시작하세요.
 상태 변경과 에이전트 위임은 명시적으로 선택해야 합니다.
@@ -54,14 +53,17 @@ worktree로 여는 `w` 키와, 이슈 상세 화면의 댓글 보기가 추가�
 j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  Esc back
 ```
 
-### 이슈 → git worktree (`w`)
+### 이슈 → Git worktree 또는 jj workspace (`w`)
 
-이슈에서(목록이든 상세 화면이든) `w`를 누르면 그 이슈 전용 git worktree를
-herdr workspace로 열어 작업할 수 있습니다. 세 번만 고르면 되고, `Esc`는 한
+이슈에서(목록이든 상세 화면이든) `w`를 누르면 그 이슈 전용 Git worktree 또는 jj workspace를
+herdr UI workspace로 열어 작업할 수 있습니다. 세 번만 고르면 되고, `Esc`는 한
 단계 뒤로, `1`–`9`는 해당 줄을 바로 선택합니다.
 
-**1. 프로젝트** — herdr에 열려 있는 git 프로젝트 목록이며, 현재 프로젝트가 맨
+**1. 프로젝트** — herdr에 열려 있는 Git/jj 프로젝트 목록이며, 현재 프로젝트가 맨
 위(★)입니다. `type path…`로 다른 저장소 경로를 직접 입력할 수 있습니다.
+무관한 jj 후보가 고장 나거나 jj 실행 파일이 없어도 정상 Git 프로젝트는 목록에
+남습니다. 실패 후보의 herdr workspace·경로·오류는 프로젝트 선택창에서 스크롤해
+확인할 수 있습니다. 직접 지정한 잘못된 저장소는 오류로 처리합니다.
 
 ```
 ╭ worktree for PROJ-142 — project ─────────────────────────────────────╮
@@ -72,8 +74,8 @@ herdr workspace로 열어 작업할 수 있습니다. 세 번만 고르면 되�
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-**2. Worktree** — `+ new worktree`는 이슈 키 이름의 브랜치를 만들고(`Enter`
-전에 이름 수정 가능), 기존 worktree를 고르면 그것을 다시 엽니다.
+**2. Checkout** — `+ new`는 이슈 키 이름의 Git 브랜치/worktree 또는 jj
+workspace를 만들고(`Enter` 전에 이름 수정 가능), 기존 checkout은 다시 엽니다.
 
 ```
 ╭ worktree for PROJ-142 — mobile-app ──────────────────────────────────╮
@@ -87,7 +89,7 @@ herdr workspace로 열어 작업할 수 있습니다. 세 번만 고르면 되�
 **3. 에이전트** — 스냅샷을 읽지 않고 worktree만 열거나,
 `[[delegate.agents]]`에서 에이전트를 고릅니다. 완전한 스냅샷은 submit
 설정에 따라 전송되고, 경고가 있을 때만 제한된 Jira 문맥을 확인한 뒤
-진행합니다. 마지막 선택창에는 저장소, 브랜치, 기존/새 checkout 여부와
+진행합니다. 마지막 선택창에는 저장소, checkout 이름, 기존/새 checkout 여부와
 설정한 기준 ref 또는 선택한 소스 브랜치의 `HEAD`가 표시됩니다.
 
 ```
@@ -98,9 +100,10 @@ herdr workspace로 열어 작업할 수 있습니다. 세 번만 고르면 되�
 ╰───────────────────────────────────────────╯
 ```
 
-herdr는 worktree를 프로젝트와 묶인 새 workspace로 엽니다. 1단계를 건너뛰려면
+herdr는 checkout을 UI workspace로 엽니다. Git worktree는 프로젝트와
+묶이지만 jj checkout은 일반 herdr UI workspace를 사용합니다. 1단계를 건너뛰려면
 `[worktree.repos]`에 Jira 프로젝트별 저장소를 지정하세요. 전체 옵션은
-[Worktree (`w`)](#worktree-w)를 참고하세요.
+[Git worktree와 jj workspace (`w`)](#git-worktree와-jj-workspace-w)를 참고하세요.
 
 ## 기능
 
@@ -124,10 +127,9 @@ herdr는 worktree를 프로젝트와 묶인 새 workspace로 엽니다. 1단계�
   크기가 제한된 스냅샷을 준비하고 전송 전에 프롬프트를 확인합니다. 또는
   **+ start new agent…**(`n`)로 종류와 디렉터리를 고르면 herdr가 `pane run`으로
   에이전트를 시작하고 준비된 뒤 확인한 프롬프트를 보냅니다.
-- **Worktree** — `w`는 선택한 이슈의 git worktree를 만들거나 다시 엽니다.
-  herdr 자체의 worktree 생성처럼 프로젝트 단위로 동작합니다: herdr 프로젝트
-  하나를 고르고(현재 프로젝트가 맨 위), **+ new worktree**(이름은 이슈 키로 미리
-  채워짐)나 기존 worktree 중 하나를 고른 다음, 원하면 그 안에서 Jira
+- **Checkout** — `w`는 선택한 이슈의 Git worktree나 네이티브 jj workspace를
+  만들거나 다시 엽니다. 프로젝트를 고르고(현재 프로젝트가 맨 위), **+ new**
+  (이름은 이슈 키로 미리 채워짐)나 기존 checkout을 고른 다음, 원하면 그 안에서 Jira
   프롬프트를 받을 에이전트를 시작합니다.
 
 Jira Cloud(이메일 + API 토큰)와 Jira Server / Data Center(개인 액세스 토큰)를
@@ -155,7 +157,7 @@ Handoff 변경 사항: 제한된 조회/오류 복구에 이어, 위임의 기�
 
 ## 설치
 
-herdr **0.8.0 이상**과, 설치 시 Rust 툴체인(https://rustup.rs)이 필요합니다.
+herdr **0.8.0 이상**과 설치 시 **Rust 1.89 이상** 툴체인(https://rustup.rs)이 필요합니다.
 
 이 포크(플러그인 id `han.jira-worktree`, `w` worktree 키 포함)는 다음처럼
 설치합니다:
@@ -229,9 +231,9 @@ herdr 액션 팔레트에서 **Jira: open (split)** 또는 **Jira: open (tab)**�
 쓰거나 직접 `[[filters]]`를 정의할 수도 있습니다. 변경 후 패널에서 `R`을
 누르세요. `Enter`로 이슈를 읽고, `w`로 **no agent**를 선택해 에이전트 없이
 worktree를 열 수 있습니다. 조회에는 저장소 매핑도 에이전트도 필요 없습니다.
-`w`에서는 열려 있는 herdr git 프로젝트를 고르거나 저장소 경로를 입력하세요.
-`[worktree.repos]`는 이 선택을 생략하는 선택 설정입니다. 새 브랜치의 기본
-기준은 선택한 저장소의 `HEAD`이지 `origin/main`이 아닙니다.
+`w`에서는 열려 있는 Git/jj 프로젝트를 고르거나 저장소 경로를 입력하세요.
+`[worktree.repos]`는 이 선택을 생략하는 선택 설정입니다. 새 Git 브랜치의 기본 기준은 선택한 저장소의 `HEAD`이지 `origin/main`이
+아닙니다. jj 기본 기준은 소스 `@`의 부모 커밋입니다.
 
 ## 패널 열기
 
@@ -268,7 +270,7 @@ command = "han.jira-worktree.open-jira-tab"
 | `s` | 이슈 상태 변경 |
 | `d` | 실행 중인 에이전트에게 이슈 위임, 또는 새 에이전트 시작 |
 | `D` | 준비 실패로 전송되지 않았을 때 남아 있는 같은 에이전트 패널만 재확인·전송 (전달 여부가 불확실한 전송 실패에는 재시도 금지) |
-| `w` | 이슈용 git worktree (프로젝트 → 새/기존 worktree → 에이전트 선택) |
+| `w` | Git worktree 또는 jj workspace (프로젝트 → 새/기존 checkout → 에이전트 선택) |
 | `n` | delegate 선택창에서: 새 에이전트 시작 |
 | `1`–`9` | 팝업(에이전트, 전환, 필터)에서 바로 선택 |
 | `o` | 브라우저에서 이슈 열기 |
@@ -356,80 +358,125 @@ idle 대기는 하나의 `wait_ready_ms` 예산을 공유합니다. 준비 실�
 **전송되지 않으며** `D`는 새 에이전트를 만들지 않고 남아 있는 패널을 다시
 확인합니다. `wait_ready_ms = 0`은 확인을 끄므로 콜드 스타트에는 권장하지 않습니다.
 
-## Worktree (`w`)
+## Git worktree와 jj workspace (`w`)
 
-`w`(이슈 목록 또는 이슈 상세에서)는 이슈용 git worktree를 만들거나 다시
-엽니다. herdr 자체의 worktree 생성처럼 프로젝트 단위로 동작하며, `Esc`는 한
-단계 뒤로 갑니다:
+`w`는 이슈 목록·상세에서 Git worktree 또는 네이티브 jj workspace를 만들거나
+다시 엽니다. 같은 루트에서 둘 다 사용 가능하면 기본값은 jj 우선이며,
+`[worktree].prefer = "git"`는 우선순위만 바꿉니다. jj 실행 파일이 없어도 같은
+루트에서 Git을 사용할 수 있으면 사용 가능한 Git을 선택창에 표시하고 선택합니다.
+선택 후 발생한 오류에는 다른 백엔드로 전환하지 않습니다. 가장 가까운 상위
+저장소 루트를 사용합니다. jj는 0.38 이상 및 workspace 목록/JSON 이스케이프
+템플릿 기능이 필요합니다. Git 저장소를 백엔드로 쓰는 jj 저장소라고 해서
+곧바로 Git checkout도 사용 가능한 것은 아닙니다. `Esc`는 이전 단계로 돌아갑니다:
 
-1. **프로젝트** — 프로젝트 키별 `[worktree.repos]`(`PROJ-1666`이면 `PROJ`),
-   없으면 `[worktree].repo`, 그것도 없으면 herdr에 열려 있는 git
-   프로젝트(`herdr workspace list`) 중에서 고릅니다: 소스 저장소마다 한 줄이며,
-   현재 workspace의 프로젝트가 맨 위(★, 이 패널이 그 프로젝트의 linked
-   worktree에서 실행 중일 때도 해당)이고 나머지는 workspace 순서입니다. 각 줄에
-   소스 checkout 경로와 열린 worktree workspace 수가 표시됩니다. 마지막 줄
-   **type path…**(`/`)로 아무 저장소 디렉터리나 입력할 수 있습니다.
-2. **Worktree** — 프로젝트의 checkout 목록(`herdr worktree list`)이며, herdr
-   workspace에 이미 열려 있으면 `[open]`이 붙습니다. **+ new worktree**는
-   이름을 묻는데, `branch` 템플릿(기본 `{key}`)으로 미리 채워지고 자유롭게
-   고칠 수 있습니다(`Ctrl-U`로 지우기). `Enter`를 누르면 유효한 git 브랜치
-   이름으로 정리됩니다. 기존 worktree를 고르면 그것을 다시 엽니다. 이슈의
-   worktree가 이미 있으면 미리 선택됩니다.
-3. **에이전트** — **no agent**는 Jira 스냅샷을 조회하지 않고 worktree만
-   엽니다. `[[delegate.agents]]`의 에이전트를 고르면 `d`와 동일한 제한된
-   문맥을 확인한 뒤 worktree를 열고 에이전트를 시작합니다. 선택창에는 저장소,
-   브랜치, 기존/새 checkout 여부와 설정한 기준 ref 또는 소스 브랜치의 `HEAD`
-   (암묵적 `origin/main` 아님)가 표시됩니다. `submit`은
-   `[worktree].submit`이 없으면 `[delegate].submit`을 따릅니다.
-   `[worktree] submit = false`면 붙여 넣기만 하므로 에이전트에서 직접 확인·수정한
-   뒤 Enter를 누르세요.
+1. **프로젝트** — Jira 프로젝트 키별 `[worktree.repos]`, 없으면
+   `[worktree].repo`, 없으면 열려 있는 Git/jj 프로젝트(현재 프로젝트 우선)
+   또는 **type path…**(`/`)로 저장소 경로를 고릅니다. 공통 저장소를 공유하는
+   프로젝트는 중복 표시하지 않습니다. jj workspace는 네이티브 jj checkout이며
+   herdr UI workspace와는 서로 다른 개념입니다.
+하위 디렉터리에서 열린 UI 패널도 가장 가까운 checkout 루트가 같으면 열린
+checkout으로 인식합니다. 중첩 저장소와 서로 다른 sibling checkout 루트는
+별도로 취급합니다.
+2. **Checkout** — Git은 브랜치 이름, jj는 workspace 이름으로 기존 checkout을
+   고르거나 **+ new**에서 이슈 키로 미리 채운 이름을 수정합니다(`Ctrl-U`로
+   지우기). 일치하는 기존 항목이 미리 선택되고 `[open]`은 herdr에서 그 경로가
+   열린 상태입니다. 오래된 jj workspace 메타데이터에는 최신 jj 실행 파일을
+   사용해도 기존 workspace 경로가 없을 수 있습니다. 이때 경로를 입력하세요.
+   저장소와 workspace 이름을 검증하며, 동일성을 명확히 확인할 수 없으면 열기를
+   거부합니다. 경로를 추측하거나 같은 이름의 checkout을 다시 만들지 않습니다.
+3. **에이전트** — **no agent**는 Jira 스냅샷 없이 열고, 에이전트를 고르면 `d`와
+   같은 제한된 문맥을 checkout 생성 **전에** 확인합니다. 선택창에는 백엔드,
+   이름, 기존/새 checkout, 기준이 표시됩니다. Git 새 브랜치 기본 기준은 소스
+   `HEAD`(암묵적 `origin/main` 아님), 설정한 Git `base`는 `{key}` 등을
+   치환하지 않는 **그대로의 ref**입니다. jj에서 기준을 비우면 소스 `@`의
+   부모 커밋(`@` 자체가 아님)입니다. `[worktree].submit`은
+   `[delegate].submit`을 덮어쓰며 `false`면 붙여 넣기만 합니다.
 
-`config.toml` 끝(`[[delegate.agents]]` 뒤)에 `[worktree]` 테이블을 추가합니다:
+`config.toml`에서 `[[delegate.agents]]` 뒤에 다음 테이블을 추가하세요:
 
 ```toml
 [worktree]
-# repo = "~/workspace/platform"        # 선택 사항; 생략하면 herdr 프로젝트 선택
-branch = "{key}"                       # 이름 미리 채우기, 예: "{type}/{key}-{slug}"
-# base = "origin/main"                 # 선택적 덮어쓰기; 기본: 선택한 저장소의 HEAD
-focus = true                           # worktree workspace로 포커스 이동
-# path = "~/worktrees/{branch}"        # checkout 경로 (기본: herdr의 worktrees 디렉터리)
-# label = "{key}"                      # workspace 라벨
-# trust_repository = false             # --trust-repository 전달; 검증한 저장소에만
-# submit = false                       # 생략 = [delegate].submit; false = 붙여 넣기만, Enter는 직접
+# repo = "~/workspace/platform"      # 생략하면 herdr 프로젝트 선택
+prefer = "jj"                         # 기본값; "git"은 Git 우선
+branch = "{key}"                      # Git 브랜치 입력, 예: "{type}/{key}-{slug}"
+# base = "origin/main"               # Git 전용 literal ref; 기본: 선택한 저장소 HEAD
+# path = "~/worktrees/{branch}"      # Git 전용; 기본: herdr worktrees 디렉터리
+focus = true
+# label = "{key}"                    # herdr UI workspace 라벨
+# trust_repository = false           # Git 전용; 직접 확인한 저장소만
+# submit = false                     # 생략하면 [delegate].submit
 
-[worktree.repos]                       # Jira 프로젝트 키별
+[worktree.jj]
+name = "{key}"                        # 네이티브 jj workspace 이름
+# base = "main@origin"               # 생략하면 소스 @의 부모 커밋
+# path = "~/jj/{name}"               # 생략하면 ~/.herdr/jj-workspaces/<repo-name>-<stable repo-key digest>/<name-slug>
+
+[worktree.repos]
 PROJ = "~/workspace/project"
 ```
 
-### Worktree checkout
+### Git checkout
 
-저장소 디렉터리는 git 저장소 안에 있어야 합니다. 플러그인은 먼저 해당 브랜치의
-기존 worktree를 열어 보고, herdr가 `worktree_not_found`를 보고할 때만 새로
-만듭니다:
+**+ new**에서 새 Git 이름을 선택했을 때에만 먼저 `worktree open`을 시도하고,
+herdr가 구조화된 `worktree_not_found`를 보고하면 `worktree create`를 호출합니다.
+기존 항목을 선택하면 검증된 정확한 경로로 herdr UI workspace를 열거나 재사용하며,
+checkout이 사라졌더라도 다시 만들지 않습니다:
 
 ```sh
 herdr worktree open --cwd <repo> --branch <branch> [--label <label>] --focus|--no-focus
 herdr worktree create --cwd <repo> --branch <branch> [--base <ref>] [--path <path>] [--label <label>] --focus|--no-focus
 ```
 
-herdr는 checkout을 저장소 workspace와 묶인 새 workspace로 열고, 에이전트는 그
-루트 패널에서 실행됩니다. 그 worktree의 workspace가 이미 열려 있으면, 에이전트는
-거기에 이슈 키로 이름 붙은 새 탭에서 실행됩니다. 플러그인은 이미 에이전트가
-돌고 있을 수 있는 패널에 절대 입력하지 않습니다. `focus`는
-`--focus`/`--no-focus`를 정합니다. `trust_repository = true`면 두 명령 모두에
-`--trust-repository`를 붙입니다. 직접 검증한 저장소에만 켜세요.
-
-worktree와 그 workspace를 정리하려면:
+Git worktree는 저장소와 묶인 herdr UI workspace로 열립니다.
+`trust_repository = true`는 검증한 Git 저장소에 한해 두 명령에
+`--trust-repository`를 전달합니다. Git 정리:
 
 ```sh
-herdr worktree remove --workspace <id>   # 커밋하지 않은 변경이 있으면 --force 추가
+herdr worktree remove --workspace <id>   # 미커밋 변경이 있으면 --force 추가
 ```
 
-### Worktree placeholder
+### 네이티브 jj checkout
 
-`branch`: `{key}` `{slug}` `{type}`. `path`와 `label`은 추가로 `{branch}`도
-받습니다. 이름은 유효한 git ref로 정리됩니다. 요약에 ASCII 문자나 숫자가
-없으면 `{slug}`가 비므로, `{key}-{slug}`는 키만 남습니다.
+플러그인은 bookmark를 만들거나 소스 checkout을 이동하지 않고 jj 명령으로
+workspace를 생성합니다. jj `name`은 bookmark가 아닌 workspace 이름입니다:
+
+```sh
+jj -R <source> workspace add --name <name> [-r <base>] <destination>
+```
+
+jj의 기본 네이티브 colocation 동작을 그대로 사용하므로 jj 자체가 연관된 Git
+worktree를 만들 수도 있습니다. jj 생성에 `herdr worktree create`를 사용하지
+않습니다. 기본 경로는 herdr의 Git worktrees 디렉터리와 무관한
+`~/.herdr/jj-workspaces/<repo-name>-<stable repo-key digest>/<name-slug>`입니다.
+생성 후 네이티브 이름과 경로를 확인하며 충돌한 경로를 덮어쓰지 않습니다.
+herdr의 일반 UI workspace로 열기 때문에 Git의 내장 프로젝트 묶음과 같지
+않습니다. 이미 열린 UI workspace는 재사용하되 에이전트는 사용 중인 패널에
+입력하지 않고 새 탭에서 시작합니다. 일반 workspace 생성 시 herdr의 기존
+신뢰 검사를 따르며 jj에는 `trust_repository`로 이를 건너뛸 수 없습니다.
+
+jj 생성은 `~/.herdr/jj-workspaces/.native-receipts-v1`의 jj 전용 기록을
+사용합니다. native add 전에 `Pending`을 영속 기록하고, 종료 코드가 0이며
+새 native 동일성을 검증하고 `Ready`를 영속 기록한 뒤에만 herdr UI에 연결합니다.
+add가 실패하면 부분 생성 파일을 보존하고 항상 오류를 반환합니다(`Failed` 기록이
+실패하면 `Pending`이 남을 수 있습니다). `Ready` 이후 UI 열기가 실패했다면
+같은 이름·경로·기준의 **New** 요청으로 다시 열 수 있습니다. 앱 재시작 뒤에도
+현재 native 동일성과 일치하는 `Ready`를 확인한 경우에만 add를 건너뜁니다.
+`Pending`/`Failed` 또는 Ready 확정 전 중단 상태에서는 성공을 추측하거나
+자동 재시도·삭제·reset하지 않습니다. 경로와 native 상태를 직접 점검한 뒤
+**Existing**을 선택하고 확인 화면에서 대문자 `I`로 이번 요청의 복구 열기만
+승인하세요(`Enter`, 숫자 `1`, 소문자 `i`는 승인이 아닙니다). 이 승인은 기록을
+`Ready`로 바꾸지 않습니다. 외부에서 정상 생성된 Existing은 이 승인이 필요
+없습니다. 같은 이름의 다른 checkout, 경로 교체, 모호한 jj 이름은 거부됩니다.
+정리 전 상태를 검토하고 jj의 네이티브 workspace 명령을 사용하세요. jj에
+`herdr worktree remove`를 사용하지 마세요.
+
+### Checkout placeholder
+
+두 이름은 `{key}`, `{slug}`, `{type}`을 받습니다. Git `branch`는 유효한 Git
+ref로 정리되고 jj `name`은 네이티브 workspace 이름입니다. `label`, Git
+`path`, jj `path`에는 중립적인 `{name}`을 사용할 수 있습니다. `{branch}`는
+Git 전용이며 jj 라벨에서는 오류가 납니다. 요약에 ASCII 영문자·숫자가 없으면
+`{slug}`는 빈 값이므로 `{key}-{slug}`는 키만 남습니다.
 
 ### 수동 확인 체크리스트
 
@@ -445,14 +492,15 @@ herdr worktree remove --workspace <id>   # 커밋하지 않은 변경이 있으�
   수정·스냅샷 시각과 경고를 보고 적절할 때만 확정. 에이전트의 답변이 실제
   이슈 문맥을 근거로 삼는지 확인. 근거 있는 handoff / 실제 handoff 기회 수 기록.
 - 짝을 이룬 작업: 적절한 저장소에서 `w`의 no agent와 에이전트 시작을 각각
-  시도. 표시된 저장소/브랜치/기준 또는 기존 checkout과 `submit = false`/
+  시도. 표시된 저장소/백엔드/이름/기준 또는 기존 checkout과 `submit = false`/
   `submit = true`, focus 덮어쓰기를 확인. 성공한 짝 작업 / 실제 짝 작업 기회
   수 기록.
 - 다음 관련 이슈에서 안내 없이 `d`/`w`를 다시 선택하는지 관찰하고 자발적
   재사용 / 이후 실제 관련 기회 수 기록. 기회가 없음을 실패로 세거나 이
   체크리스트로 성공률을 주장하지 마세요. 상태 `s`는 에이전트 출력으로 자동
-  변경되지 않으므로 직접 확인·선택하세요. 불필요한 worktree는 미커밋 변경을
-  검토한 후 `herdr worktree remove --workspace <id>`로 직접 정리하세요.
+  변경되지 않으므로 직접 확인·선택하세요. 불필요한 Git worktree는 미커밋 변경을 검토한 후
+  `herdr worktree remove --workspace <id>`로 직접 정리하고, jj는 jj의
+  네이티브 workspace 정리 명령을 사용하세요.
 
 ## 라이선스
 

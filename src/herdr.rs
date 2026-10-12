@@ -2,8 +2,11 @@
 //! docs recommend. Used to list running agents, start a new agent, and hand an
 //! issue prompt to one.
 
+use crate::checkout::{self, Backend, Entry, Listing, Repository, Request, Selection};
 use serde_json::Value;
+use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -37,40 +40,12 @@ pub struct StartAgentOpts {
     /// "tab" | "right" | "down".
     pub placement: String,
     pub focus: bool,
-    /// Workspace for tab/split placement; required there. Ignored (may be
-    /// empty) when `worktree` is Some: herdr opens the worktree in its own
-    /// workspace.
+    /// Workspace for tab/split placement. Checkout placement ignores it.
     pub workspace_id: String,
     /// Optional label for a newly created tab (usually the issue key).
     pub tab_label: String,
-    /// Some = run the agent in a git worktree of `cwd` (the repo dir); `placement` is ignored.
-    pub worktree: Option<WorktreeOpts>,
-}
-
-/// How to open or create the git worktree a new agent runs in.
-#[derive(Debug, Clone, Default)]
-pub struct WorktreeOpts {
-    /// Branch name; already rendered and sanitized, non-empty.
-    pub branch: String,
-    /// Base ref for a new branch; empty = omit `--base` (herdr default).
-    pub base: String,
-    /// Checkout path, already expanded; empty = omit `--path` (herdr default).
-    pub path: String,
-    /// Workspace label; empty = omit `--label`.
-    pub label: String,
-    /// Append `--trust-repository` to both `worktree open` and `worktree create`.
-    pub trust_repository: bool,
-}
-
-/// A worktree workspace returned by `herdr worktree open|create`.
-#[derive(Debug, Clone)]
-pub struct OpenedWorktree {
-    pub workspace_id: String,
-    /// Root pane of the worktree workspace.
-    pub pane_id: String,
-    pub checkout_path: String,
-    /// The workspace was already open; its root pane may be running an agent.
-    pub already_open: bool,
+    /// Frozen selected checkout shared across handoff worker clones; ordinary launches pass None.
+    pub checkout: Option<Arc<Request>>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,16 +57,13 @@ pub struct HerdrWorkspace {
     pub tab_count: u64,
     pub pane_count: u64,
     pub agent_status: String,
-    /// Git checkout of the workspace; None for non-git workspaces.
+    /// Git checkout of the workspace, if herdr exposed Git metadata.
     pub repo: Option<WorkspaceRepo>,
 }
 
 /// The `worktree` object of a `workspace list` entry.
 #[derive(Debug, Clone)]
 pub struct WorkspaceRepo {
-    /// Shared by the source checkout and all its linked worktrees (`…/.git`).
-    pub repo_key: String,
-    pub repo_name: String,
     /// Source checkout root, also for linked worktrees.
     pub repo_root: String,
     #[allow(dead_code)]
@@ -99,28 +71,30 @@ pub struct WorkspaceRepo {
     pub is_linked_worktree: bool,
 }
 
-/// A source repository ("project") herdr has open in at least one workspace.
+/// A source repository herdr has open in at least one workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoProject {
     pub name: String,
-    /// Source checkout root; the `--cwd` for `herdr worktree` commands.
     pub root: String,
     pub repo_key: String,
-    /// Workspaces open on linked worktrees of this repo.
+    pub backend: Backend,
     pub open_worktrees: usize,
-    /// The workspace hosting this Jira pane belongs to this repo.
     pub current: bool,
 }
 
-/// One checkout from `herdr worktree list`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoWorktree {
-    pub branch: String,
-    pub path: String,
-    /// A herdr workspace is open on it.
-    pub open: bool,
-    /// The source checkout, not a linked worktree.
-    pub is_main: bool,
+#[derive(Debug, Clone)]
+pub struct ProjectInventory {
+    pub projects: Vec<RepoProject>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenedCheckout {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub checkout_path: String,
+    /// The UI workspace was reused; its root pane may be busy.
+    pub already_open: bool,
 }
 
 fn herdr_bin() -> String {
@@ -257,8 +231,6 @@ fn parse_workspace(w: &Value) -> Option<HerdrWorkspace> {
     let text = |v: &Value| v.as_str().unwrap_or("").to_string();
     let wt = &w["worktree"];
     let repo = wt.is_object().then(|| WorkspaceRepo {
-        repo_key: text(&wt["repo_key"]),
-        repo_name: text(&wt["repo_name"]),
         repo_root: text(&wt["repo_root"]),
         checkout_path: text(&wt["checkout_path"]),
         is_linked_worktree: wt["is_linked_worktree"].as_bool().unwrap_or(false),
@@ -275,25 +247,142 @@ fn parse_workspace(w: &Value) -> Option<HerdrWorkspace> {
     })
 }
 
-/// Source repositories herdr has open, current one first (see
-/// `projects_from_workspaces`). "Current" is the workspace hosting this pane
-/// (`HERDR_WORKSPACE_ID`), or the focused one outside herdr.
-pub fn list_projects() -> Result<Vec<RepoProject>, String> {
-    let mut ws = list_workspaces()?;
-    // `workspace list` reports `"worktree": null` for some git workspaces;
-    // `worktree list --workspace` still knows their repo. Non-git workspaces
-    // fail the probe and stay without a repo.
-    for w in ws.iter_mut().filter(|w| w.repo.is_none()) {
-        if let Ok(v) = run(&["worktree", "list", "--workspace", w.id.as_str()]) {
-            w.repo = repo_from_worktree_list(&v["result"], &w.id);
-        }
+fn discover_candidate(path: &str, prefer: Backend) -> Result<Option<Repository>, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("cannot inspect workspace directory {path}: {e}"))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "workspace checkout candidate is not a directory: {path}"
+        ));
     }
+    match checkout::resolve_repository(path, prefer) {
+        Ok(repo) => Ok(Some(repo)),
+        Err(error) if error.starts_with("no Git or jj checkout contains ") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Discover native checkouts from stable pane cwd (never foreground_cwd).
+/// Git metadata remains a fallback for herdr workspaces without a shell pane.
+/// A failing candidate does not hide healthy projects from other workspaces.
+pub fn list_projects(prefer: Backend) -> Result<ProjectInventory, String> {
+    let mut ws = list_workspaces()?;
     let current = std::env::var("HERDR_WORKSPACE_ID")
         .ok()
         .filter(|id| !id.is_empty())
         .or_else(|| ws.iter().find(|w| w.focused).map(|w| w.id.clone()))
         .unwrap_or_default();
-    Ok(projects_from_workspaces(&ws, &current))
+    let mut out: Vec<(u64, RepoProject)> = Vec::new();
+    let mut warnings = Vec::new();
+    for w in &mut ws {
+        let mut found = Vec::new();
+        match run(&["pane", "list", "--workspace", &w.id]) {
+            Ok(panes) => {
+                if let Some(panes) = panes["result"]["panes"].as_array() {
+                    for pane in panes {
+                        if let Some(cwd) = pane["cwd"].as_str().filter(|s| !s.is_empty()) {
+                            match discover_candidate(cwd, prefer) {
+                                Ok(Some(repo)) => {
+                                    if !found.iter().any(|r: &Repository| r.key == repo.key) {
+                                        found.push(repo);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => warnings.push(format!(
+                                    "workspace '{}' ({}) pane cwd {cwd}: {error}",
+                                    w.label, w.id
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "workspace '{}' ({}) pane {} has no stable cwd",
+                                w.label,
+                                w.id,
+                                pane["pane_id"].as_str().unwrap_or("(unknown)")
+                            ));
+                        }
+                    }
+                } else {
+                    warnings.push(format!(
+                        "workspace '{}' ({}) has no readable pane inventory",
+                        w.label, w.id
+                    ));
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "workspace '{}' ({}) pane inventory: {}",
+                w.label, w.id, error.message
+            )),
+        }
+        if found.is_empty() && w.repo.is_none() {
+            match run(&["worktree", "list", "--workspace", &w.id]) {
+                Ok(v) => w.repo = repo_from_worktree_list(&v["result"], &w.id),
+                Err(error) => warnings.push(format!(
+                    "workspace '{}' ({}) worktree metadata: {}",
+                    w.label, w.id, error.message
+                )),
+            }
+        }
+        if let Some(meta) = &w.repo {
+            let candidate = if meta.checkout_path.is_empty() {
+                &meta.repo_root
+            } else {
+                &meta.checkout_path
+            };
+            match discover_candidate(candidate, prefer) {
+                Ok(Some(repo)) => {
+                    if !found.iter().any(|r: &Repository| r.key == repo.key) {
+                        found.push(repo);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warnings.push(format!(
+                    "workspace '{}' ({}) checkout {candidate}: {error}",
+                    w.label, w.id
+                )),
+            }
+        }
+        for repo in found {
+            let idx = out
+                .iter()
+                .position(|(_, project)| project.repo_key == repo.key);
+            if let Some(idx) = idx {
+                let (first, project) = &mut out[idx];
+                *first = (*first).min(w.number);
+                if repo.root != project.root {
+                    project.open_worktrees += 1;
+                }
+                if w.id == current {
+                    project.current = true;
+                    project.root = repo.root.clone();
+                }
+            } else {
+                out.push((
+                    w.number,
+                    RepoProject {
+                        name: repo.name,
+                        root: repo.root,
+                        repo_key: repo.key,
+                        backend: repo.backend,
+                        open_worktrees: usize::from(
+                            repo.backend == Backend::Git
+                                && w.repo.as_ref().is_some_and(|r| r.is_linked_worktree),
+                        ),
+                        current: w.id == current,
+                    },
+                ));
+            }
+        }
+    }
+    out.sort_by_key(|(first, project)| (!project.current, *first));
+    let projects = out
+        .into_iter()
+        .map(|(_, project)| project)
+        .collect::<Vec<_>>();
+    if projects.is_empty() && !warnings.is_empty() {
+        return Err(format!("project discovery failed: {}", warnings.join("; ")));
+    }
+    Ok(ProjectInventory { projects, warnings })
 }
 
 /// The repo of `workspace_id` from its `worktree list --workspace` result:
@@ -312,8 +401,6 @@ fn repo_from_worktree_list(result: &Value, workspace_id: &str) -> Option<Workspa
             .find(|w| w["open_workspace_id"].as_str() == Some(workspace_id))
     });
     Some(WorkspaceRepo {
-        repo_key,
-        repo_name: text(&source["repo_name"]),
         checkout_path: own
             .and_then(|w| w["path"].as_str())
             .map_or_else(|| text(&source["source_checkout_path"]), str::to_string),
@@ -324,87 +411,62 @@ fn repo_from_worktree_list(result: &Value, workspace_id: &str) -> Option<Workspa
     })
 }
 
-/// One project per repo (`repo_key`): linked-worktree workspaces fold into
-/// their source repo. The repo of `current_ws_id` comes first (even when that
-/// workspace is a linked worktree); the rest follow their lowest workspace number.
-pub fn projects_from_workspaces(ws: &[HerdrWorkspace], current_ws_id: &str) -> Vec<RepoProject> {
-    // (lowest workspace number, project)
-    let mut out: Vec<(u64, RepoProject)> = Vec::new();
-    for w in ws {
-        let Some(r) = &w.repo else { continue };
-        if r.repo_key.is_empty() || r.repo_root.is_empty() {
-            continue;
-        }
-        let idx = match out.iter().position(|(_, p)| p.repo_key == r.repo_key) {
-            Some(idx) => idx,
-            None => {
-                let name = if r.repo_name.is_empty() {
-                    std::path::Path::new(&r.repo_root)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| r.repo_root.clone())
-                } else {
-                    r.repo_name.clone()
-                };
-                out.push((
-                    w.number,
-                    RepoProject {
-                        name,
-                        root: r.repo_root.clone(),
-                        repo_key: r.repo_key.clone(),
-                        open_worktrees: 0,
-                        current: false,
-                    },
-                ));
-                out.len() - 1
-            }
-        };
-        let (first, project) = &mut out[idx];
-        *first = (*first).min(w.number);
-        if r.is_linked_worktree {
-            project.open_worktrees += 1;
-        }
-        if !current_ws_id.is_empty() && w.id == current_ws_id {
-            project.current = true;
-        }
-    }
-    out.sort_by_key(|(first, p)| (!p.current, *first));
-    out.into_iter().map(|(_, p)| p).collect()
-}
-
-/// Checkouts of the repo at `repo_root`: the source checkout and its linked worktrees.
-pub fn list_worktrees(repo_root: &str) -> Result<Vec<RepoWorktree>, String> {
-    let v = run(&["worktree", "list", "--cwd", repo_root])?;
-    Ok(parse_worktrees(&v["result"]))
-}
-
-/// `worktree list` result → openable checkouts; bare, prunable and
-/// branchless (detached) entries are skipped: `worktree open` needs a branch.
-fn parse_worktrees(result: &Value) -> Vec<RepoWorktree> {
-    let Some(list) = result["worktrees"].as_array() else {
-        return vec![];
-    };
-    list.iter()
+/// Worktree metadata fallback when herdr does not expose a stable pane cwd.
+fn git_entries(repository: &Repository) -> Result<Vec<Entry>, String> {
+    let v = run(&["worktree", "list", "--cwd", &repository.root])?;
+    let list = v["result"]["worktrees"]
+        .as_array()
+        .ok_or_else(|| "herdr worktree list did not return worktrees".to_string())?;
+    Ok(list
+        .iter()
         .filter_map(|w| {
-            let flag = |k: &str| w[k].as_bool().unwrap_or(false);
+            let flag = |key: &str| w[key].as_bool().unwrap_or(false);
             if flag("is_bare") || flag("is_prunable") {
                 return None;
             }
+            let path = w["path"].as_str().filter(|s| !s.is_empty())?.to_string();
             let branch = w["branch"].as_str().unwrap_or("");
             let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
-            if branch.is_empty() {
-                return None;
-            }
-            Some(RepoWorktree {
-                branch: branch.to_string(),
-                path: w["path"].as_str().unwrap_or("").to_string(),
-                open: w["open_workspace_id"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty()),
-                is_main: !flag("is_linked_worktree"),
+            let name = if branch.is_empty() {
+                Path::new(&path).file_name()?.to_string_lossy().into_owned()
+            } else {
+                branch.to_string()
+            };
+            Some(Entry {
+                name,
+                path: Some(path),
+                open: false,
+                is_source: !flag("is_linked_worktree"),
             })
         })
-        .collect()
+        .collect())
+}
+
+pub fn resolve_and_list(path: &str, prefer: Backend) -> Result<Listing, String> {
+    let repository = checkout::resolve_repository(path, prefer)?;
+    let mut entries = match repository.backend {
+        Backend::Jj => checkout::list(&repository)?,
+        Backend::Git => git_entries(&repository)?,
+    };
+    let paths = workspace_checkout_paths(&repository)?;
+    for entry in &mut entries {
+        if let Some(path) = &entry.path {
+            let Ok(actual) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            let owners = paths.iter().filter(|(_, root)| root == &actual).count();
+            if owners > 1 {
+                return Err(format!(
+                    "multiple herdr workspaces use {path}; select or close one manually"
+                ));
+            }
+            entry.open |= owners == 1;
+        }
+    }
+    Ok(Listing {
+        repository,
+        entries,
+    })
 }
 
 /// Result of creating a tab: the tab id plus its single root shell pane.
@@ -533,90 +595,289 @@ fn run_agent_in_pane(
     })
 }
 
-/// Open the worktree for `wt.branch` in the repo at `repo_cwd`, creating it
-/// (and the branch, if needed) only when herdr reports `worktree_not_found`.
-/// Any other error is returned as-is; nothing is retried with extra trust.
-pub fn open_or_create_worktree(
-    repo_cwd: &str,
-    wt: &WorktreeOpts,
+fn git_new_checkout(
+    request: &Request,
     focus: bool,
-) -> Result<OpenedWorktree, String> {
-    if repo_cwd.trim().is_empty() {
-        return Err("worktree: repository directory is empty".into());
-    }
-    if wt.branch.trim().is_empty() {
-        return Err("worktree: branch name is empty".into());
-    }
-    let worktree_args = |action: &str| -> Vec<String> {
-        let mut args: Vec<String> = vec![
-            "worktree".into(),
-            action.into(),
+    name: &str,
+    base: &str,
+    path: &str,
+) -> Result<OpenedCheckout, String> {
+    let worktree_args = |action: &str| {
+        let mut args = vec![
+            "worktree".to_string(),
+            action.to_string(),
             "--cwd".into(),
-            repo_cwd.into(),
+            request.repository.root.clone(),
             "--branch".into(),
-            wt.branch.clone(),
+            name.to_string(),
         ];
         if action == "create" {
-            for (flag, value) in [("--base", &wt.base), ("--path", &wt.path)] {
+            for (flag, value) in [("--base", base), ("--path", path)] {
                 if !value.is_empty() {
-                    args.push(flag.into());
-                    args.push(value.clone());
+                    args.extend([flag.to_string(), value.to_string()]);
                 }
             }
         }
-        if !wt.label.is_empty() {
-            args.push("--label".into());
-            args.push(wt.label.clone());
+        if !request.label.is_empty() {
+            args.extend(["--label".into(), request.label.clone()]);
         }
         args.push(if focus { "--focus" } else { "--no-focus" }.into());
-        if wt.trust_repository {
+        if request.trust_repository {
             args.push("--trust-repository".into());
         }
         args
     };
     let open = worktree_args("open");
-    let open_refs: Vec<&str> = open.iter().map(|s| s.as_str()).collect();
-    let v = match run(&open_refs) {
-        Ok(v) => v,
-        Err(e) if e.code.as_deref() == Some("worktree_not_found") => {
+    let refs = open.iter().map(String::as_str).collect::<Vec<_>>();
+    let response = match run(&refs) {
+        Ok(value) => value,
+        Err(error) if error.code.as_deref() == Some("worktree_not_found") => {
             run_owned(&worktree_args("create"))?
         }
-        Err(e) => return Err(e.into()),
+        Err(error) => return Err(error.into()),
     };
-    parse_opened_worktree(&v["result"])
-}
-
-fn parse_opened_worktree(result: &Value) -> Result<OpenedWorktree, String> {
-    let non_empty = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
-    let root = &result["root_pane"];
-    let pane_id = non_empty(&root["pane_id"])
+    let result = &response["result"];
+    let pane_id = result["root_pane"]["pane_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("worktree: no root_pane.pane_id in response: {result}"))?;
-    let workspace_id = non_empty(&result["workspace"]["workspace_id"])
-        .or_else(|| non_empty(&root["workspace_id"]))
+    let workspace_id = result["workspace"]["workspace_id"]
+        .as_str()
+        .or_else(|| result["root_pane"]["workspace_id"].as_str())
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("worktree: no workspace_id in response: {result}"))?;
-    let checkout_path = non_empty(&result["worktree"]["path"])
-        .or_else(|| non_empty(&result["workspace"]["worktree"]["checkout_path"]))
-        .or_else(|| non_empty(&root["cwd"]))
-        .unwrap_or_default();
-    Ok(OpenedWorktree {
-        workspace_id,
-        pane_id,
-        checkout_path,
+    let checkout_path = result["worktree"]["path"]
+        .as_str()
+        .or_else(|| result["workspace"]["worktree"]["checkout_path"].as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("worktree: no checkout path in response: {result}"))?;
+    let actual = checkout::validate_existing(&request.repository, name, checkout_path)
+        .map_err(|error| format!("{error}; herdr checkout at {checkout_path} was retained"))?;
+    let actual_path = actual.path.unwrap();
+    if let Some(cwd) = result["root_pane"]["cwd"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        if std::fs::canonicalize(cwd).ok() != std::fs::canonicalize(&actual_path).ok() {
+            return Err(format!(
+                "herdr root pane cwd {cwd} differs from checkout {actual_path}; checkout retained"
+            ));
+        }
+    }
+    Ok(OpenedCheckout {
+        workspace_id: workspace_id.into(),
+        pane_id: pane_id.into(),
+        checkout_path: actual_path,
         already_open: result["already_open"].as_bool().unwrap_or(false),
     })
 }
 
-/// Spawn a new agent. Returns the agent identity we can later send to.
-///
-/// - `placement = "tab"`: create a new tab and run the agent **in its root
-///   pane** (one terminal).
-/// - `placement = "right"|"down"`: split a pane in the selected workspace,
-///   then run the command in the new shell pane.
-/// - `worktree = Some(..)`: `placement` is ignored. Open (or create) the git
-///   worktree of `cwd` as its own herdr workspace and run the agent in its
-///   fresh root pane; if that workspace was already open, run it in a new tab
-///   there instead of touching the existing root pane. The agent's cwd is the
-///   checkout path. `workspace_id` is ignored and may be empty.
+/// A pane's configured cwd is stable; foreground_cwd reflects navigation in
+/// an interactive shell and is not evidence of checkout ownership. Only the
+/// closest filesystem checkout boundary can own a selected native checkout.
+fn workspace_checkout_paths(
+    repository: &Repository,
+) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    let mut paths = Vec::new();
+    for workspace in list_workspaces()? {
+        let mut candidates = Vec::new();
+        if let Some(repo) = &workspace.repo {
+            let path = if repo.checkout_path.is_empty() {
+                &repo.repo_root
+            } else {
+                &repo.checkout_path
+            };
+            if path.is_empty() {
+                return Err(format!(
+                    "workspace '{}' ({}) has checkout metadata without a path",
+                    workspace.label, workspace.id
+                ));
+            }
+            candidates.push(path.to_string());
+        }
+        let panes = run(&["pane", "list", "--workspace", &workspace.id]).map_err(|error| {
+            format!(
+                "workspace '{}' ({}) pane inventory: {}",
+                workspace.label, workspace.id, error.message
+            )
+        })?;
+        let panes = panes["result"]["panes"].as_array().ok_or_else(|| {
+            format!(
+                "workspace '{}' ({}) has no readable pane inventory",
+                workspace.label, workspace.id
+            )
+        })?;
+        for pane in panes {
+            let cwd = pane["cwd"]
+                .as_str()
+                .filter(|cwd| !cwd.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "workspace '{}' ({}) has a pane without a stable cwd",
+                        workspace.label, workspace.id
+                    )
+                })?;
+            candidates.push(cwd.to_string());
+        }
+        for candidate in candidates {
+            let boundary =
+                checkout::nearest_checkout_boundary(Path::new(&candidate)).map_err(|error| {
+                    format!(
+                        "workspace '{}' ({}) checkout path {candidate}: {error}",
+                        workspace.label, workspace.id
+                    )
+                })?;
+            if let Some(boundary) = boundary {
+                let matching_backend = match repository.backend {
+                    Backend::Git => boundary.has_git,
+                    Backend::Jj => boundary.has_jj,
+                };
+                if matching_backend
+                    && !paths
+                        .iter()
+                        .any(|(id, root)| id == &workspace.id && root == &boundary.root)
+                {
+                    paths.push((workspace.id.clone(), boundary.root));
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn attach_checkout(
+    request: &Request,
+    checkout_path: &str,
+    focus: bool,
+) -> Result<OpenedCheckout, String> {
+    let paths = workspace_checkout_paths(&request.repository)
+        .map_err(|e| format!("{e}; checkout retained at {checkout_path}"))?;
+    let root = std::fs::canonicalize(checkout_path).map_err(|e| format!("{checkout_path}: {e}"))?;
+    let mut matches = paths
+        .iter()
+        .filter(|(_, path)| path == &root)
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    if matches.len() > 1 {
+        return Err(format!(
+            "multiple herdr workspaces use {checkout_path}; select or close one manually"
+        ));
+    }
+    if let Some(id) = matches.first() {
+        if focus {
+            run(&["workspace", "focus", id])
+                .map_err(|e| format!("{}; checkout retained at {}", e.message, root.display()))?;
+        }
+        return Ok(OpenedCheckout {
+            workspace_id: (*id).into(),
+            pane_id: String::new(),
+            checkout_path: root.to_string_lossy().into_owned(),
+            already_open: true,
+        });
+    }
+    let mut args = vec![
+        "workspace".to_string(),
+        "create".into(),
+        "--cwd".into(),
+        root.to_string_lossy().into_owned(),
+    ];
+    if !request.label.is_empty() {
+        args.extend(["--label".into(), request.label.clone()]);
+    }
+    args.push(if focus { "--focus" } else { "--no-focus" }.into());
+    let result =
+        run_owned(&args).map_err(|e| format!("{e}; checkout retained at {}", root.display()))?;
+    let value = &result["result"];
+    let ws = value["workspace"]["workspace_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "workspace create: missing workspace_id; checkout retained at {}",
+                root.display()
+            )
+        })?;
+    let tab = value["tab"]["tab_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "workspace create: missing tab_id; checkout retained at {}",
+                root.display()
+            )
+        })?;
+    let pane = &value["root_pane"];
+    let pane_id = pane["pane_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "workspace create: missing root pane; checkout retained at {}",
+                root.display()
+            )
+        })?;
+    if pane["workspace_id"].as_str().is_some_and(|id| id != ws)
+        || pane["tab_id"].as_str().is_some_and(|id| id != tab)
+    {
+        return Err(format!(
+            "workspace create: mismatched root pane; checkout retained at {}",
+            root.display()
+        ));
+    }
+    if pane["cwd"]
+        .as_str()
+        .is_some_and(|cwd| std::fs::canonicalize(cwd).ok().as_ref() != Some(&root))
+    {
+        return Err(format!(
+            "workspace create: root pane cwd differs from {}; checkout retained",
+            root.display()
+        ));
+    }
+    Ok(OpenedCheckout {
+        workspace_id: ws.into(),
+        pane_id: pane_id.into(),
+        checkout_path: root.to_string_lossy().into_owned(),
+        already_open: false,
+    })
+}
+
+/// Existing never recreates a missing selection. Native jj addition and UI
+/// attachment are separate durable steps: on UI failure the checkout survives.
+pub fn open_or_create_checkout(request: &Request, focus: bool) -> Result<OpenedCheckout, String> {
+    if request.repository.root.is_empty() || request.name().trim().is_empty() {
+        return Err("checkout: repository and name must not be empty".into());
+    }
+    let current =
+        checkout::resolve_repository(&request.repository.root, request.repository.backend)?;
+    if current.backend != request.repository.backend
+        || current.key != request.repository.key
+        || current.root != request.repository.root
+    {
+        return Err("checkout source repository has changed; reselect the project".into());
+    }
+    match (&request.repository.backend, &request.selection) {
+        (Backend::Git, Selection::New { name, base, path }) => {
+            git_new_checkout(request, focus, name, base, path)
+        }
+        (Backend::Jj, _) => {
+            let prepared = checkout::ensure_jj(request)?;
+            attach_checkout(request, prepared.entry.path.as_deref().unwrap(), focus)
+        }
+        (Backend::Git, Selection::Existing(entry)) => {
+            let path = entry
+                .path
+                .as_deref()
+                .ok_or_else(|| format!("Git checkout '{}' has no path", entry.name))?;
+            let verified = checkout::validate_existing(&request.repository, &entry.name, path)?;
+            attach_checkout(request, verified.path.as_deref().unwrap(), focus)
+        }
+    }
+}
+
+/// Spawn an agent into a fresh checkout root pane, or a fresh tab when its UI
+/// workspace is reused; never overwrite a possibly busy existing root pane.
 pub fn start_agent(opts: &StartAgentOpts) -> Result<HerdrAgent, String> {
     if opts.argv.is_empty() {
         return Err("agent command is empty".into());
@@ -631,14 +892,22 @@ pub fn start_agent(opts: &StartAgentOpts) -> Result<HerdrAgent, String> {
         opts.tab_label.as_str()
     };
 
-    if let Some(wt_opts) = &opts.worktree {
-        let wt = open_or_create_worktree(&opts.cwd, wt_opts, opts.focus)?;
-        let pane_id = if wt.already_open {
-            create_tab(&wt.workspace_id, &wt.checkout_path, tab_label, opts.focus)?.pane_id
+    if let Some(request) = &opts.checkout {
+        let opened = open_or_create_checkout(request, opts.focus)?;
+        let pane_id = if opened.already_open {
+            create_tab(
+                &opened.workspace_id,
+                &opened.checkout_path,
+                tab_label,
+                opts.focus,
+            )
+            .map_err(|e| format!("{e}; checkout retained at {}", opened.checkout_path))?
+            .pane_id
         } else {
-            wt.pane_id
+            opened.pane_id
         };
-        return run_agent_in_pane(&pane_id, &opts.name, &opts.argv, &wt.checkout_path);
+        return run_agent_in_pane(&pane_id, &opts.name, &opts.argv, &opened.checkout_path)
+            .map_err(|e| format!("{e}; checkout retained at {}", opened.checkout_path));
     }
 
     if opts.workspace_id.trim().is_empty() {

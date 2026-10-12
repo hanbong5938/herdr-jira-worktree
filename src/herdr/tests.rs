@@ -174,89 +174,8 @@ fn opts(placement: &str) -> StartAgentOpts {
         focus: false,
         workspace_id: "w2".into(),
         tab_label: "TEST-1".into(),
-        worktree: None,
+        checkout: None,
     }
-}
-
-const CHECKOUT: &str = "/tmp/wt/project/test-1";
-
-fn worktree_opts() -> WorktreeOpts {
-    WorktreeOpts {
-        branch: "TEST-1".into(),
-        base: "origin/main".into(),
-        path: CHECKOUT.into(),
-        label: "TEST-1".into(),
-        trust_repository: false,
-    }
-}
-
-fn worktree_opts_start() -> StartAgentOpts {
-    StartAgentOpts {
-        worktree: Some(worktree_opts()),
-        ..opts("tab")
-    }
-}
-
-/// `worktree open --cwd <repo> --branch TEST-1 --label TEST-1 <focus> [trust]`.
-fn worktree_open_args(extra: &[&'static str]) -> Vec<&'static str> {
-    let mut args = vec![
-        "worktree",
-        "open",
-        "--cwd",
-        "/tmp/project with spaces",
-        "--branch",
-        "TEST-1",
-        "--label",
-        "TEST-1",
-    ];
-    args.extend(extra);
-    args
-}
-
-/// `worktree create ... --base origin/main --path <checkout> --label TEST-1 <focus> [trust]`.
-fn worktree_create_args(extra: &[&'static str]) -> Vec<&'static str> {
-    let mut args = vec![
-        "worktree",
-        "create",
-        "--cwd",
-        "/tmp/project with spaces",
-        "--branch",
-        "TEST-1",
-        "--base",
-        "origin/main",
-        "--path",
-        CHECKOUT,
-        "--label",
-        "TEST-1",
-    ];
-    args.extend(extra);
-    args
-}
-
-/// Real `herdr worktree open|create` result shape (trimmed).
-fn worktree_response(kind: &str, already_open: bool) -> Value {
-    json!({"id": "cli:worktree", "result": {
-        "type": kind,
-        "already_open": already_open,
-        "root_pane": {"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "cwd": CHECKOUT},
-        "tab": {"tab_id": "w3:t1"},
-        "workspace": {"workspace_id": "w3", "label": "TEST-1",
-            "worktree": {"checkout_path": CHECKOUT, "is_linked_worktree": true}},
-        "worktree": {"branch": "TEST-1", "path": CHECKOUT, "open_workspace_id": "w3"}
-    }})
-}
-
-fn run_in_pane_steps(pane: &'static str) -> Vec<Step> {
-    vec![
-        Step::ok(
-            &["pane", "run", pane, "claude --model 'model name'"],
-            json!({"result": {}}),
-        ),
-        Step::ok(
-            &["agent", "rename", pane, "jira-TEST-1"],
-            json!({"result": {}}),
-        ),
-    ]
 }
 
 fn tab_start_steps() -> Vec<Step> {
@@ -640,112 +559,159 @@ fn invalid_start_options_do_not_invoke_cli() {
     mock.assert_complete();
 }
 
-#[test]
-fn invalid_worktree_options_do_not_invoke_cli() {
-    let mock = MockCli::new(vec![]);
-    let mut options = worktree_opts_start();
-    options.worktree = Some(WorktreeOpts {
-        branch: " ".into(),
-        ..worktree_opts()
-    });
-    assert!(start_agent(&options).is_err());
-    assert!(open_or_create_worktree("", &worktree_opts(), false).is_err());
-    mock.assert_complete();
+struct GitFixture {
+    root: PathBuf,
+    linked: PathBuf,
+}
+
+impl GitFixture {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-jira-git-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let root = dir.join("source");
+        let linked = dir.join("feature");
+        fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-b", "main", root.to_str().unwrap()]);
+        run(&[
+            "-C",
+            root.to_str().unwrap(),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+        run(&[
+            "-C",
+            root.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            linked.to_str().unwrap(),
+        ]);
+        Self { root, linked }
+    }
+
+    fn request(&self, selection: Selection) -> Request {
+        Request {
+            repository: checkout::resolve_repository(self.root.to_str().unwrap(), Backend::Jj)
+                .unwrap(),
+            selection,
+            label: "TEST-1".into(),
+            trust_repository: false,
+            recovery_acknowledged: false,
+        }
+    }
+
+    fn existing(&self) -> Request {
+        self.request(Selection::Existing(Entry {
+            name: "feature".into(),
+            path: Some(self.linked.to_str().unwrap().into()),
+            open: false,
+            is_source: false,
+        }))
+    }
+}
+
+impl Drop for GitFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(self.root.parent().unwrap());
+    }
+}
+
+fn generic_response(cwd: &str) -> Value {
+    json!({"result": {"type": "workspace_created",
+        "workspace": {"workspace_id": "w3"},
+        "tab": {"tab_id": "w3:t1"},
+        "root_pane": {"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "cwd": cwd}}})
 }
 
 #[test]
-fn new_worktree_branch_is_created_then_agent_runs_in_its_root_pane() {
-    let mut steps = vec![
-        Step::error(&worktree_open_args(&["--no-focus"]), "worktree_not_found"),
+fn selected_existing_git_uses_exact_path_and_a_fresh_ui_root() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let steps = vec![
         Step::ok(
-            &worktree_create_args(&["--no-focus"]),
-            worktree_response("worktree_created", false),
+            &["workspace", "list"],
+            json!({"result": {"workspaces": []}}),
         ),
-    ];
-    steps.extend(run_in_pane_steps("w3:p1"));
-    let mock = MockCli::new(steps);
-    let started = start_agent(&worktree_opts_start()).unwrap();
-    assert_eq!(started.target, "w3:p1");
-    assert_eq!(started.cwd, CHECKOUT);
-    mock.assert_complete();
-}
-
-#[test]
-fn worktree_start_does_not_need_a_workspace() {
-    let mut steps = vec![
-        Step::error(&worktree_open_args(&["--no-focus"]), "worktree_not_found"),
         Step::ok(
-            &worktree_create_args(&["--no-focus"]),
-            worktree_response("worktree_created", false),
-        ),
-    ];
-    steps.extend(run_in_pane_steps("w3:p1"));
-    let mock = MockCli::new(steps);
-    let mut options = worktree_opts_start();
-    options.workspace_id.clear();
-    let started = start_agent(&options).unwrap();
-    assert_eq!(started.target, "w3:p1");
-    assert_eq!(started.cwd, CHECKOUT);
-    mock.assert_complete();
-}
-
-#[test]
-fn empty_worktree_base_path_and_label_are_omitted() {
-    let mock = MockCli::new(vec![
-        Step::error(
             &[
-                "worktree",
-                "open",
-                "--cwd",
-                "/tmp/project with spaces",
-                "--branch",
-                "TEST-1",
-                "--no-focus",
-            ],
-            "worktree_not_found",
-        ),
-        Step::ok(
-            &[
-                "worktree",
+                "workspace",
                 "create",
                 "--cwd",
-                "/tmp/project with spaces",
-                "--branch",
+                path,
+                "--label",
                 "TEST-1",
                 "--no-focus",
             ],
-            worktree_response("worktree_created", false),
+            generic_response(path),
         ),
-    ]);
-    let wt = WorktreeOpts {
-        branch: "TEST-1".into(),
-        ..WorktreeOpts::default()
-    };
-    let opened = open_or_create_worktree("/tmp/project with spaces", &wt, false).unwrap();
-    assert_eq!(opened.pane_id, "w3:p1");
-    mock.assert_complete();
-}
-
-#[test]
-fn closed_worktree_is_reopened_without_create() {
-    let mut steps = vec![Step::ok(
-        &worktree_open_args(&["--no-focus"]),
-        worktree_response("worktree_opened", false),
-    )];
-    steps.extend(run_in_pane_steps("w3:p1"));
+    ];
     let mock = MockCli::new(steps);
-    let started = start_agent(&worktree_opts_start()).unwrap();
-    assert_eq!(started.target, "w3:p1");
-    assert_eq!(started.cwd, CHECKOUT);
+    let opened = open_or_create_checkout(&repo.existing(), false).unwrap();
+    assert_eq!(opened.checkout_path, path);
+    assert_eq!(opened.pane_id, "w3:p1");
+    assert!(!opened.already_open);
     mock.assert_complete();
 }
 
 #[test]
-fn already_open_worktree_gets_a_new_tab_instead_of_its_busy_root_pane() {
-    let mut steps = vec![
+fn vanished_selection_is_never_recreated_even_with_valid_branch() {
+    let repo = GitFixture::new();
+    let mock = MockCli::new(vec![]);
+    let mut request = repo.existing();
+    if let Selection::Existing(entry) = &mut request.selection {
+        entry.path = Some(
+            repo.root
+                .parent()
+                .unwrap()
+                .join("vanished")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    assert!(open_or_create_checkout(&request, false)
+        .unwrap_err()
+        .contains("vanished"));
+    mock.assert_complete();
+}
+
+#[test]
+fn existing_ui_workspace_uses_new_tab_without_running_busy_root() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let steps = vec![
         Step::ok(
-            &worktree_open_args(&["--no-focus"]),
-            worktree_response("worktree_opened", true),
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "w3", "number": 3, "worktree": null}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w3"],
+            json!({"result": {"panes": [{"workspace_id": "w3", "pane_id": "w3:p1",
+                "cwd": path, "foreground_cwd": "/some/other/repo"}]}}),
         ),
         Step::ok(
             &[
@@ -754,285 +720,735 @@ fn already_open_worktree_gets_a_new_tab_instead_of_its_busy_root_pane() {
                 "--workspace",
                 "w3",
                 "--cwd",
-                CHECKOUT,
+                path,
                 "--label",
                 "TEST-1",
                 "--no-focus",
             ],
             json!({"result": {"tab": {"tab_id": "w3:t2"}, "root_pane": {"pane_id": "w3:p2"}}}),
         ),
+        Step::ok(
+            &["pane", "run", "w3:p2", "claude --model 'model name'"],
+            json!({"result": {}}),
+        ),
+        Step::ok(
+            &["agent", "rename", "w3:p2", "jira-TEST-1"],
+            json!({"result": {}}),
+        ),
     ];
-    steps.extend(run_in_pane_steps("w3:p2"));
-    steps.extend([
-        Step::ok(&["agent", "get", "w3:p2"], json!({"result": {"agent": {}}})),
-        Step::error(
-            &[
-                "agent",
-                "wait",
-                "w3:p2",
-                "--until",
-                "idle",
-                "--timeout",
-                "TIMEOUT<=5000",
-            ],
-            "timeout",
-        ),
-        Step::ok(&["agent", "get", "w3:p2"], json!({"result": {"agent": {}}})),
-        Step::ok(
-            &[
-                "agent",
-                "wait",
-                "w3:p2",
-                "--until",
-                "idle",
-                "--timeout",
-                "TIMEOUT<=5000",
-            ],
-            json!({"result": {}}),
-        ),
-        Step::ok(
-            &["pane", "send-text", "w3:p2", "prompt"],
-            json!({"result": {}}),
-        ),
-    ]);
     let mock = MockCli::new(steps);
-    let failure = start_and_delegate(&worktree_opts_start(), "prompt", false, 0, 5000).unwrap_err();
-    assert!(failure.retry_safe);
-    let agent = failure.agent.unwrap();
-    assert_eq!(agent.pane_id, "w3:p2");
-    assert_eq!(agent.cwd, CHECKOUT);
-    let resumed = resume_delegation(&agent, "prompt", false, 5000).unwrap();
-    assert_eq!(resumed.pane_id, "w3:p2");
-    assert_eq!(resumed.cwd, CHECKOUT);
+    let mut options = opts("tab");
+    options.checkout = Some(repo.existing().into());
+    let started = start_agent(&options).unwrap();
+    assert_eq!(started.pane_id, "w3:p2");
+    assert_eq!(started.cwd, path);
     mock.assert_complete();
 }
 
 #[test]
-fn worktree_open_errors_other_than_not_found_do_not_create() {
-    let mock = MockCli::new(vec![Step::error(
-        &worktree_open_args(&["--no-focus"]),
-        "not_git_worktree",
-    )]);
-    assert!(start_agent(&worktree_opts_start())
-        .unwrap_err()
-        .contains("not_git_worktree"));
-    mock.assert_complete();
-}
-
-#[test]
-fn worktree_response_without_root_pane_does_not_run_agent() {
+fn conflicting_ui_workspaces_are_not_guessed_or_overwritten() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let subdir = repo.linked.join("src");
+    fs::create_dir(&subdir).unwrap();
     let mock = MockCli::new(vec![
-        Step::error(&worktree_open_args(&["--no-focus"]), "worktree_not_found"),
         Step::ok(
-            &worktree_create_args(&["--no-focus"]),
-            json!({"result": {"type": "worktree_created",
-                "root_pane": {"workspace_id": "w3", "cwd": CHECKOUT},
-                "workspace": {"workspace_id": "w3"},
-                "worktree": {"branch": "TEST-1", "path": CHECKOUT}}}),
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "w3"}, {"workspace_id": "w4"}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w3"],
+            json!({"result": {"panes": [{"cwd": subdir}, {"cwd": path}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w4"],
+            json!({"result": {"panes": [{"cwd": path}]}}),
         ),
     ]);
-    assert!(start_agent(&worktree_opts_start())
+    assert!(open_or_create_checkout(&repo.existing(), false)
         .unwrap_err()
-        .contains("root_pane.pane_id"));
+        .contains("multiple"));
     mock.assert_complete();
 }
 
 #[test]
-fn trusted_repository_flag_is_passed_to_open_and_create() {
+fn git_new_creates_only_for_structured_not_found_and_uses_explicit_trust() {
+    let repo = GitFixture::new();
+    let source = repo.root.to_str().unwrap();
+    let path = repo.linked.to_str().unwrap();
+    let mut request = repo.request(Selection::New {
+        name: "feature".into(),
+        base: "main".into(),
+        path: path.into(),
+    });
+    request.trust_repository = true;
     let mock = MockCli::new(vec![
         Step::error(
-            &worktree_open_args(&["--focus", "--trust-repository"]),
+            &[
+                "worktree",
+                "open",
+                "--cwd",
+                source,
+                "--branch",
+                "feature",
+                "--label",
+                "TEST-1",
+                "--focus",
+                "--trust-repository",
+            ],
             "worktree_not_found",
         ),
         Step::ok(
-            &worktree_create_args(&["--focus", "--trust-repository"]),
-            worktree_response("worktree_created", false),
+            &[
+                "worktree",
+                "create",
+                "--cwd",
+                source,
+                "--branch",
+                "feature",
+                "--base",
+                "main",
+                "--path",
+                path,
+                "--label",
+                "TEST-1",
+                "--focus",
+                "--trust-repository",
+            ],
+            json!({"result": {"root_pane": {"pane_id": "w3:p1", "cwd": path},
+                "workspace": {"workspace_id": "w3"}, "worktree": {"path": path}}}),
         ),
     ]);
-    let wt = WorktreeOpts {
-        trust_repository: true,
-        ..worktree_opts()
+    let opened = open_or_create_checkout(&request, true).unwrap();
+    assert_eq!(opened.checkout_path, path);
+    mock.assert_complete();
+}
+
+#[test]
+fn unrelated_git_open_error_does_not_create_or_retry_with_trust() {
+    let repo = GitFixture::new();
+    let request = repo.request(Selection::New {
+        name: "feature".into(),
+        base: String::new(),
+        path: String::new(),
+    });
+    let mock = MockCli::new(vec![Step::error(
+        &[
+            "worktree",
+            "open",
+            "--cwd",
+            repo.root.to_str().unwrap(),
+            "--branch",
+            "feature",
+            "--label",
+            "TEST-1",
+            "--no-focus",
+        ],
+        "repository_untrusted",
+    )]);
+    assert!(open_or_create_checkout(&request, false)
+        .unwrap_err()
+        .contains("repository_untrusted"));
+    mock.assert_complete();
+}
+
+#[test]
+fn jj_native_checkout_survives_ui_failure_and_retry_reuses_same_path() {
+    let Some(repo) = crate::checkout::tests::Fixture::new(false) else {
+        return;
     };
-    let opened = open_or_create_worktree("/tmp/project with spaces", &wt, true).unwrap();
+    let checkout_path = repo.dir.join("native-space");
+    let path = checkout_path.to_str().unwrap();
+    let request = repo.request("native-space", &checkout_path, "");
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": []}}),
+        ),
+        Step::error(
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                path,
+                "--label",
+                "native-space",
+                "--no-focus",
+            ],
+            "workspace_create_failed",
+        ),
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": []}}),
+        ),
+        Step::ok(
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                path,
+                "--label",
+                "native-space",
+                "--no-focus",
+            ],
+            generic_response(path),
+        ),
+    ]);
+    let error = open_or_create_checkout(&request, false).unwrap_err();
+    assert!(error.contains(path));
+    assert!(checkout_path.join(".jj").is_dir());
+    fs::write(checkout_path.join("user-file"), "preserve me").unwrap();
+    let opened = open_or_create_checkout(&request, false).unwrap();
+    assert_eq!(opened.checkout_path, path);
+    assert_eq!(
+        fs::read_to_string(checkout_path.join("user-file")).unwrap(),
+        "preserve me"
+    );
+    mock.assert_complete();
+}
+
+#[test]
+fn malformed_generic_root_pane_does_not_launch_agent() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": []}}),
+        ),
+        Step::ok(
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                path,
+                "--label",
+                "TEST-1",
+                "--no-focus",
+            ],
+            json!({"result": {"workspace": {"workspace_id": "w3"},
+                "tab": {"tab_id": "w3:t1"}, "root_pane": {"cwd": path}}}),
+        ),
+    ]);
+    let mut options = opts("tab");
+    options.checkout = Some(repo.existing().into());
+    assert!(start_agent(&options)
+        .unwrap_err()
+        .contains("missing root pane"));
+    mock.assert_complete();
+}
+
+#[test]
+fn project_discovery_folds_linked_jj_store_with_current_source() {
+    let Some(repo) = crate::checkout::tests::Fixture::new(false) else {
+        return;
+    };
+    let linked = repo.dir.join("linked");
+    drop(checkout::ensure_jj(&repo.request("linked", &linked, "")).unwrap());
+    let source = repo.root.to_str().unwrap();
+    let linked_path = linked.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "w1", "number": 1},
+                {"workspace_id": "w2", "number": 2}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w1"],
+            json!({"result": {"panes": [{"cwd": source}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w2"],
+            json!({"result": {"panes": [{"cwd": linked_path}]}}),
+        ),
+    ]);
+    let old = std::env::var_os("HERDR_WORKSPACE_ID");
+    std::env::set_var("HERDR_WORKSPACE_ID", "w2");
+    let projects = list_projects(Backend::Jj);
+    match old {
+        Some(value) => std::env::set_var("HERDR_WORKSPACE_ID", value),
+        None => std::env::remove_var("HERDR_WORKSPACE_ID"),
+    }
+    let inventory = projects.unwrap();
+    assert!(inventory.warnings.is_empty());
+    assert_eq!(inventory.projects.len(), 1);
+    assert_eq!(inventory.projects[0].backend, Backend::Jj);
+    assert_eq!(inventory.projects[0].root, linked_path);
+    assert!(inventory.projects[0].current);
+    assert_eq!(inventory.projects[0].open_worktrees, 1);
+    mock.assert_complete();
+}
+
+#[test]
+fn checkout_subdirectory_reopens_existing_ui_workspace() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let subdir = repo.linked.join("src");
+    fs::create_dir(&subdir).unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "w1"}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w1"],
+            json!({"result": {"panes": [
+                {"cwd": subdir, "foreground_cwd": repo.root},
+                {"cwd": path}
+            ]}}),
+        ),
+    ]);
+    let opened = open_or_create_checkout(&repo.existing(), false).unwrap();
+    assert_eq!(opened.workspace_id, "w1");
+    assert_eq!(opened.checkout_path, path);
+    assert!(opened.already_open);
+    mock.assert_complete();
+}
+
+#[test]
+fn nested_repo_boundary_does_not_claim_parent_checkout() {
+    let repo = GitFixture::new();
+    let nested = repo.linked.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&nested)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let subdir = nested.join("src");
+    fs::create_dir(&subdir).unwrap();
+    let path = repo.linked.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "nested"}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "nested"],
+            json!({"result": {"panes": [{"cwd": subdir, "foreground_cwd": path}]}}),
+        ),
+        Step::ok(
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                path,
+                "--label",
+                "TEST-1",
+                "--no-focus",
+            ],
+            generic_response(path),
+        ),
+    ]);
+    let opened = open_or_create_checkout(&repo.existing(), false).unwrap();
+    assert!(!opened.already_open);
     assert_eq!(opened.workspace_id, "w3");
-    assert_eq!(opened.pane_id, "w3:p1");
-    assert_eq!(opened.checkout_path, CHECKOUT);
+    mock.assert_complete();
+}
+
+#[test]
+fn sibling_checkout_and_foreground_cwd_do_not_claim_selection() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let source = repo.root.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "source"}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "source"],
+            json!({"result": {"panes": [{"cwd": source, "foreground_cwd": path}]}}),
+        ),
+        Step::ok(
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                path,
+                "--label",
+                "TEST-1",
+                "--no-focus",
+            ],
+            generic_response(path),
+        ),
+    ]);
+    let opened = open_or_create_checkout(&repo.existing(), false).unwrap();
     assert!(!opened.already_open);
     mock.assert_complete();
 }
 
-/// `workspace list` entry; `repo` = (repo_name, checkout_path, is_linked_worktree).
-fn workspace_json(id: &str, number: u64, repo: Option<(&str, &str, bool)>) -> Value {
-    let mut w = json!({"workspace_id": id, "label": id, "number": number, "focused": false});
-    if let Some((name, checkout, linked)) = repo {
-        w["worktree"] = json!({
-            "checkout_path": checkout, "is_linked_worktree": linked,
-            "repo_key": format!("/x/{name}/.git"), "repo_name": name,
-            "repo_root": format!("/x/{name}"),
-        });
-    }
-    w
-}
-
-fn workspace(id: &str, number: u64, repo: Option<(&str, &str, bool)>) -> HerdrWorkspace {
-    parse_workspace(&workspace_json(id, number, repo)).unwrap()
-}
-
 #[test]
-fn workspace_repo_is_parsed_only_for_git_workspaces() {
-    let ws = workspace("w2", 2, Some(("backend", "/x/backend-feat", true)));
-    let repo = ws.repo.unwrap();
-    assert_eq!(repo.repo_key, "/x/backend/.git");
-    assert_eq!(repo.repo_root, "/x/backend");
-    assert_eq!(repo.checkout_path, "/x/backend-feat");
-    assert!(repo.is_linked_worktree);
-    assert!(workspace("w3", 3, None).repo.is_none());
-    assert!(parse_workspace(&json!({"label": "no id"})).is_none());
-}
-
-#[test]
-fn projects_fold_worktrees_into_their_repo_with_current_first() {
-    let ws = vec![
-        workspace("w1", 1, Some(("frontend", "/x/frontend", false))),
-        workspace("w2", 2, None),
-        workspace("w3", 3, Some(("backend", "/x/backend", false))),
-        workspace("w4", 4, Some(("jira", "/x/jira-feat", true))),
-        workspace("w5", 5, Some(("backend", "/x/backend-a", true))),
-        workspace("w6", 6, Some(("backend", "/x/backend-b", true))),
-    ];
-    let summary = |current: &str| -> Vec<(String, usize, bool)> {
-        projects_from_workspaces(&ws, current)
-            .into_iter()
-            .map(|p| (p.name, p.open_worktrees, p.current))
-            .collect()
-    };
-    let row = |name: &str, open: usize, current: bool| (name.to_string(), open, current);
-    // The current workspace is a linked worktree: its source repo still leads.
-    assert_eq!(
-        summary("w6"),
-        vec![
-            row("backend", 2, true),
-            row("frontend", 0, false),
-            row("jira", 1, false)
-        ]
-    );
-    // A repo open only as a linked worktree is still a project; the rest keep workspace order.
-    let projects = projects_from_workspaces(&ws, "w4");
-    assert_eq!(projects[0].root, "/x/jira");
-    assert_eq!(
-        summary("w4"),
-        vec![
-            row("jira", 1, true),
-            row("frontend", 0, false),
-            row("backend", 2, false)
-        ]
-    );
-    // Non-git or unknown current workspace: plain workspace order.
-    assert_eq!(summary("w2"), summary(""));
-    assert_eq!(summary("")[0], row("frontend", 0, false));
-}
-
-#[test]
-fn worktree_list_is_parsed_and_unopenable_entries_are_skipped() {
-    let mock = MockCli::new(vec![Step::ok(
-        &["worktree", "list", "--cwd", "/x/jira"],
-        json!({"result": {"type": "worktree_list",
-        "source": {"repo_key": "/x/jira/.git", "repo_name": "jira", "repo_root": "/x/jira"},
-        "worktrees": [
-            {"branch": "main", "is_bare": false, "is_detached": false,
-             "is_linked_worktree": false, "is_prunable": false,
-             "path": "/x/jira", "open_workspace_id": "w22"},
-            {"branch": "refs/heads/feat/x", "is_linked_worktree": true,
-             "path": "/x/jira-feat", "open_workspace_id": null},
-            {"branch": "old", "is_linked_worktree": true, "is_prunable": true, "path": "/gone"},
-            {"is_detached": true, "is_linked_worktree": true, "path": "/x/detached"},
-            {"branch": "", "is_bare": true, "path": "/x/bare"},
-            {"branch": "fix", "is_linked_worktree": true, "path": "/x/jira-fix"}
-        ]}}),
-    )]);
-    let wts = list_worktrees("/x/jira").unwrap();
-    mock.assert_complete();
-    let wt = |branch: &str, path: &str, open: bool, is_main: bool| RepoWorktree {
-        branch: branch.into(),
-        path: path.into(),
-        open,
-        is_main,
-    };
-    assert_eq!(
-        wts,
-        vec![
-            wt("main", "/x/jira", true, true),
-            wt("feat/x", "/x/jira-feat", false, false),
-            wt("fix", "/x/jira-fix", false, false),
-        ]
-    );
-}
-
-/// `worktree list --workspace` result for the jira repo; `feat` is open in w30.
-fn jira_worktree_list() -> Value {
-    json!({"result": {"type": "worktree_list",
-    "source": {"repo_key": "/x/jira/.git", "repo_name": "jira", "repo_root": "/x/jira",
-               "source_checkout_path": "/x/jira", "source_workspace_id": "w22"},
-    "worktrees": [
-        {"branch": "main", "is_linked_worktree": false, "path": "/x/jira",
-         "open_workspace_id": "w22"},
-        {"branch": "feat", "is_linked_worktree": true, "path": "/x/jira-feat",
-         "open_workspace_id": "w30"}
-    ]}})
-}
-
-#[test]
-fn probed_worktree_list_fills_the_workspace_repo() {
-    let list = jira_worktree_list();
-    let result = &list["result"];
-    let linked = repo_from_worktree_list(result, "w30").unwrap();
-    assert_eq!(linked.repo_key, "/x/jira/.git");
-    assert_eq!(linked.repo_name, "jira");
-    assert_eq!(linked.repo_root, "/x/jira");
-    assert_eq!(linked.checkout_path, "/x/jira-feat");
-    assert!(linked.is_linked_worktree);
-    // No worktree entry open in this workspace: it is the source checkout.
-    let source = repo_from_worktree_list(result, "w99").unwrap();
-    assert_eq!(source.checkout_path, "/x/jira");
-    assert!(!source.is_linked_worktree);
-    assert!(repo_from_worktree_list(&json!({"worktrees": []}), "w22").is_none());
-}
-
-#[test]
-fn projects_include_git_workspaces_without_worktree_info() {
-    let mut backend = workspace_json("w1", 1, Some(("backend", "/x/backend", false)));
-    backend["focused"] = json!(true);
-    let mut jira = workspace_json("w22", 22, None);
-    jira["worktree"] = Value::Null;
+fn unknown_pane_inventory_blocks_duplicate_ui_creation() {
+    let repo = GitFixture::new();
     let mock = MockCli::new(vec![
         Step::ok(
             &["workspace", "list"],
-            json!({"result": {"workspaces": [backend, jira, workspace_json("w3", 3, None)]}}),
+            json!({"result": {"workspaces": [{"workspace_id": "w1"}]}}),
+        ),
+        Step::error(&["pane", "list", "--workspace", "w1"], "pane_unavailable"),
+    ]);
+    let error = open_or_create_checkout(&repo.existing(), false).unwrap_err();
+    assert!(error.contains("w1") && error.contains("pane"));
+    assert!(error.contains(repo.linked.to_str().unwrap()));
+    mock.assert_complete();
+}
+
+#[test]
+fn missing_pane_cwd_is_not_evidence_that_checkout_is_vacant() {
+    let repo = GitFixture::new();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "w1"}]}}),
         ),
         Step::ok(
-            &["worktree", "list", "--workspace", "w22"],
-            jira_worktree_list(),
-        ),
-        Step::error(
-            &["worktree", "list", "--workspace", "w3"],
-            "not_a_git_repository",
+            &["pane", "list", "--workspace", "w1"],
+            json!({"result": {"panes": [{"pane_id": "w1:p1"}]}}),
         ),
     ]);
-    let old_ws = std::env::var_os("HERDR_WORKSPACE_ID");
-    std::env::set_var("HERDR_WORKSPACE_ID", "w22");
-    let projects = list_projects();
-    match old_ws {
-        Some(value) => std::env::set_var("HERDR_WORKSPACE_ID", value),
-        None => std::env::remove_var("HERDR_WORKSPACE_ID"),
-    }
+    let error = open_or_create_checkout(&repo.existing(), false).unwrap_err();
+    assert!(error.contains("stable cwd"));
     mock.assert_complete();
-    let names: Vec<(String, bool)> = projects
-        .unwrap()
-        .into_iter()
-        .map(|p| (p.name, p.current))
-        .collect();
-    assert_eq!(
-        names,
-        vec![("jira".to_string(), true), ("backend".to_string(), false)]
+}
+
+#[test]
+fn subdirectory_open_marking_uses_stable_checkout_boundary() {
+    let repo = GitFixture::new();
+    let subdir = repo.linked.join("src");
+    fs::create_dir(&subdir).unwrap();
+    let root = repo.root.to_str().unwrap();
+    let linked = repo.linked.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["worktree", "list", "--cwd", root],
+            json!({"result": {"worktrees": [
+                {"path": root, "branch": "refs/heads/main"},
+                {"path": linked, "branch": "refs/heads/feature", "is_linked_worktree": true}
+            ]}}),
+        ),
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "w1"}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w1"],
+            json!({"result": {"panes": [
+                {"cwd": subdir, "foreground_cwd": root},
+                {"cwd": subdir}
+            ]}}),
+        ),
+    ]);
+    let listing = resolve_and_list(root, Backend::Jj).unwrap();
+    assert!(
+        !listing
+            .entries
+            .iter()
+            .find(|e| e.name == "main")
+            .unwrap()
+            .open
     );
+    assert!(
+        listing
+            .entries
+            .iter()
+            .find(|e| e.name == "feature")
+            .unwrap()
+            .open
+    );
+    mock.assert_complete();
+}
+
+#[test]
+fn unrelated_broken_jj_never_blocks_git_checkout_ownership() {
+    let repo = GitFixture::new();
+    let broken = repo.root.parent().unwrap().join("broken");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join(".jj"), "invalid marker").unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "bad"}, {"workspace_id": "good"}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "bad"],
+            json!({"result": {"panes": [{"cwd": broken}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "good"],
+            json!({"result": {"panes": [{"cwd": repo.linked.join("src")}]}}),
+        ),
+    ]);
+    fs::create_dir(repo.linked.join("src")).unwrap();
+    let opened = open_or_create_checkout(&repo.existing(), false).unwrap();
+    assert_eq!(opened.workspace_id, "good");
+    mock.assert_complete();
+}
+
+#[test]
+fn broken_candidate_reports_workspace_and_path_without_hiding_git() {
+    let repo = GitFixture::new();
+    let broken = repo.root.parent().unwrap().join("broken-jj");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join(".jj"), "invalid marker").unwrap();
+    let root = repo.root.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "bad", "label": "unavailable jj", "number": 1,
+                    "worktree": {"repo_root": broken, "checkout_path": broken}},
+                {"workspace_id": "good", "label": "Git", "number": 2}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "bad"],
+            json!({"result": {"panes": [{"cwd": broken}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "good"],
+            json!({"result": {"panes": [{"cwd": root}]}}),
+        ),
+    ]);
+    let inventory = list_projects(Backend::Jj).unwrap();
+    assert_eq!(inventory.projects.len(), 1);
+    assert_eq!(inventory.projects[0].backend, Backend::Git);
+    assert_eq!(inventory.projects[0].root, root);
+    assert!(inventory
+        .warnings
+        .iter()
+        .any(|w| w.contains("bad") && w.contains(broken.to_str().unwrap())));
+    mock.assert_complete();
+}
+
+#[test]
+fn unavailable_pane_and_metadata_candidates_preserve_healthy_project() {
+    let repo = GitFixture::new();
+    let root = repo.root.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "bad", "label": "Unavailable"},
+                {"workspace_id": "good", "label": "Git"}
+            ]}}),
+        ),
+        Step::error(&["pane", "list", "--workspace", "bad"], "pane_unavailable"),
+        Step::error(
+            &["worktree", "list", "--workspace", "bad"],
+            "metadata_unavailable",
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "good"],
+            json!({"result": {"panes": [{"cwd": root}]}}),
+        ),
+    ]);
+    let inventory = list_projects(Backend::Jj).unwrap();
+    assert_eq!(inventory.projects.len(), 1);
+    assert_eq!(inventory.projects[0].root, root);
+    assert_eq!(inventory.warnings.len(), 2);
+    assert!(inventory.warnings.iter().all(|w| w.contains("bad")));
+    mock.assert_complete();
+}
+
+#[test]
+fn genuinely_empty_inventory_and_nonrepository_cwd_are_not_failures() {
+    let repo = GitFixture::new();
+    let empty = repo.root.parent().unwrap().to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "empty"}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "empty"],
+            json!({"result": {"panes": [{"cwd": empty}]}}),
+        ),
+        Step::ok(
+            &["worktree", "list", "--workspace", "empty"],
+            json!({"result": {"worktrees": []}}),
+        ),
+    ]);
+    let inventory = list_projects(Backend::Jj).unwrap();
+    assert!(inventory.projects.is_empty());
+    assert!(inventory.warnings.is_empty());
+    mock.assert_complete();
+}
+
+#[test]
+fn all_failed_candidates_return_actionable_error_not_empty_projects() {
+    let repo = GitFixture::new();
+    let broken = repo.root.parent().unwrap().join("broken-jj");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join(".jj"), "invalid marker").unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [{"workspace_id": "bad", "label": "Broken jj",
+                "worktree": {"repo_root": broken, "checkout_path": broken}}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "bad"],
+            json!({"result": {"panes": [{"cwd": broken}]}}),
+        ),
+    ]);
+    let error = list_projects(Backend::Jj).unwrap_err();
+    assert!(error.contains("bad") && error.contains(broken.to_str().unwrap()));
+    mock.assert_complete();
+}
+
+#[test]
+fn global_workspace_list_failure_stays_fatal() {
+    let mock = MockCli::new(vec![Step::error(
+        &["workspace", "list"],
+        "workspace_inventory_unavailable",
+    )]);
+    assert!(list_projects(Backend::Jj)
+        .unwrap_err()
+        .contains("workspace_inventory_unavailable"));
+    mock.assert_complete();
+}
+
+#[test]
+fn jj_native_failure_never_attempts_ui_or_agent_and_keeps_partial_checkout() {
+    let Some(repo) = crate::checkout::tests::Fixture::new(false) else {
+        return;
+    };
+    let checkout_path = repo.dir.join("native-error");
+    let request = repo.request(
+        "native-error",
+        &checkout_path,
+        "missing-revision-herdr-test",
+    );
+    let mock = MockCli::new(vec![]);
+    let mut options = opts("tab");
+    options.checkout = Some(request.into());
+    let error = start_agent(&options).unwrap_err();
+    assert!(error.contains("missing-revision-herdr-test"));
+    if checkout_path.exists() {
+        assert!(checkout_path.join(".jj").exists());
+    }
+    assert!(start_agent(&options).is_err());
+    mock.assert_complete();
+}
+
+#[test]
+fn metadata_checkout_path_marks_selected_root_when_pane_is_elsewhere() {
+    let repo = GitFixture::new();
+    let path = repo.linked.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "w1", "worktree": {"repo_root": repo.root,
+                    "checkout_path": path, "is_linked_worktree": true}}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w1"],
+            json!({"result": {"panes": [{"cwd": repo.root}]}}),
+        ),
+    ]);
+    let opened = open_or_create_checkout(&repo.existing(), false).unwrap();
+    assert_eq!(opened.workspace_id, "w1");
+    assert!(opened.already_open);
+    mock.assert_complete();
+}
+
+#[test]
+fn missing_metadata_checkout_candidate_does_not_hide_healthy_git() {
+    let repo = GitFixture::new();
+    let missing = repo.root.parent().unwrap().join("missing-jj-checkout");
+    let root = repo.root.to_str().unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "missing", "worktree": {
+                    "repo_root": missing, "checkout_path": missing}},
+                {"workspace_id": "git"}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "missing"],
+            json!({"result": {"panes": []}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "git"],
+            json!({"result": {"panes": [{"cwd": root}]}}),
+        ),
+    ]);
+    let inventory = list_projects(Backend::Jj).unwrap();
+    assert_eq!(inventory.projects.len(), 1);
+    assert!(inventory
+        .warnings
+        .iter()
+        .any(|w| w.contains("missing") && w.contains(missing.to_str().unwrap())));
+    mock.assert_complete();
+}
+
+#[test]
+fn explicit_broken_repository_is_not_replaced_with_another_project() {
+    let repo = GitFixture::new();
+    let broken = repo.root.parent().unwrap().join("selected-broken-jj");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join(".jj"), "invalid marker").unwrap();
+    let error = resolve_and_list(broken.to_str().unwrap(), Backend::Jj).unwrap_err();
+    assert!(error.contains("jj") && error.contains(broken.to_str().unwrap()));
+}
+
+#[test]
+fn zero_workspaces_is_an_empty_successful_inventory() {
+    let mock = MockCli::new(vec![Step::ok(
+        &["workspace", "list"],
+        json!({"result": {"workspaces": []}}),
+    )]);
+    let inventory = list_projects(Backend::Jj).unwrap();
+    assert!(inventory.projects.is_empty());
+    assert!(inventory.warnings.is_empty());
+    mock.assert_complete();
+}
+
+#[test]
+fn listing_rejects_ambiguous_owners_at_the_exact_root() {
+    let repo = GitFixture::new();
+    let root = repo.root.to_str().unwrap();
+    let linked = repo.linked.to_str().unwrap();
+    let subdir = repo.linked.join("src");
+    fs::create_dir(&subdir).unwrap();
+    let mock = MockCli::new(vec![
+        Step::ok(
+            &["worktree", "list", "--cwd", root],
+            json!({"result": {"worktrees": [
+                {"path": root, "branch": "refs/heads/main"},
+                {"path": linked, "branch": "refs/heads/feature", "is_linked_worktree": true}
+            ]}}),
+        ),
+        Step::ok(
+            &["workspace", "list"],
+            json!({"result": {"workspaces": [
+                {"workspace_id": "w1"}, {"workspace_id": "w2"}
+            ]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w1"],
+            json!({"result": {"panes": [{"cwd": linked}]}}),
+        ),
+        Step::ok(
+            &["pane", "list", "--workspace", "w2"],
+            json!({"result": {"panes": [{"cwd": subdir}]}}),
+        ),
+    ]);
+    let error = resolve_and_list(root, Backend::Jj).unwrap_err();
+    assert!(error.contains("multiple") && error.contains(linked));
+    mock.assert_complete();
 }

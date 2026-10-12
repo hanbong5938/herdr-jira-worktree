@@ -1,9 +1,10 @@
 [package]
 name = "herdr-jira"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
-description = "Jira TUI plugin for herdr (fork of a2u/herdr-jira): filters, search, issue comments, status transitions, delegate issues to agents, open issues in new or existing git worktrees per herdr project"
+description = "Jira TUI plugin for herdr (fork of a2u/herdr-jira): filters, search, issue comments, status transitions, agent delegation, and Git worktree or native jj workspace checkout"
 repository = "https://github.com/hanbong5938/herdr-jira-worktree"
 
 [dependencies]

@@ -106,8 +106,8 @@ pub struct DelegateConfig {
     pub wait_ready_ms: u64,
 }
 
-/// Settings for `w`: create (or reopen) a git worktree for an issue, then
-/// optionally start an agent in it (TOML table `[worktree]`).
+/// Settings for `w`: create (or reopen) a Git worktree or jj workspace for an
+/// issue, then optionally start an agent in it (TOML table `[worktree]`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorktreeConfig {
     /// Default repo for `w` when no per-project entry matches; empty = ask.
@@ -116,6 +116,10 @@ pub struct WorktreeConfig {
     /// Per Jira project key repo dirs, e.g. PROJ = "~/workspace/project".
     #[serde(default)]
     pub repos: HashMap<String, String>,
+    /// Preferred backend when the selected checkout supports both Git and jj.
+    /// A checkout with only one usable backend uses that backend instead.
+    #[serde(default)]
+    pub prefer: crate::checkout::Backend,
     /// Prefill for the worktree name input. Placeholders {key} {slug} {type}. Default "{key}".
     #[serde(default = "default_worktree_branch")]
     pub branch: String,
@@ -126,19 +130,48 @@ pub struct WorktreeConfig {
     /// (`<worktrees.directory>/<repo>/<branch-slug>`). `~`/$HOME expanded.
     #[serde(default)]
     pub path: String,
-    /// Workspace label template ({key} {slug} {type} {branch}). Default "{key}".
+    /// Native jj workspace templates; Git branch/base/path settings remain separate.
+    #[serde(default)]
+    pub jj: JjConfig,
+    /// Workspace label template ({key} {slug} {type} {name}; {branch} for Git only).
+    /// Default "{key}".
     #[serde(default = "default_worktree_label")]
     pub label: String,
     /// Pass --trust-repository. Only enable for repositories you have verified.
     #[serde(default)]
     pub trust_repository: bool,
-    /// Focus the worktree workspace after opening it. Default true.
+    /// Focus the checkout workspace after opening it. Default true.
     #[serde(default = "default_true")]
     pub focus: bool,
-    /// Submit the Jira prompt to an agent started in the worktree. Unset =
+    /// Submit the Jira prompt to an agent started in the checkout. Unset =
     /// `[delegate].submit`; false only pastes it so it can be edited first.
     #[serde(default)]
     pub submit: Option<bool>,
+}
+
+/// Templates for native jj workspaces (`[worktree.jj]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct JjConfig {
+    /// Workspace name template ({key} {slug} {type}); default "{key}".
+    #[serde(default = "default_jj_name")]
+    pub name: String,
+    /// Revision for a NEW workspace; empty uses the source checkout's @ parent(s).
+    #[serde(default)]
+    pub base: String,
+    /// Destination template ({key} {slug} {type} {name}); empty uses the
+    /// deterministic default under ~/.herdr/jj-workspaces.
+    #[serde(default)]
+    pub path: String,
+}
+
+impl Default for JjConfig {
+    fn default() -> Self {
+        Self {
+            name: default_jj_name(),
+            base: String::new(),
+            path: String::new(),
+        }
+    }
 }
 
 impl Default for WorktreeConfig {
@@ -146,9 +179,11 @@ impl Default for WorktreeConfig {
         Self {
             repo: String::new(),
             repos: HashMap::new(),
+            prefer: crate::checkout::Backend::default(),
             branch: default_worktree_branch(),
             base: String::new(),
             path: String::new(),
+            jj: JjConfig::default(),
             label: default_worktree_label(),
             trust_repository: false,
             focus: true,
@@ -200,6 +235,9 @@ fn default_wait_ready() -> u64 {
     30_000
 }
 fn default_worktree_branch() -> String {
+    "{key}".into()
+}
+fn default_jj_name() -> String {
     "{key}".into()
 }
 fn default_worktree_label() -> String {
@@ -330,6 +368,8 @@ mod tests {
         assert_eq!(cfg.worktree.repo, "~/src/app");
         assert!(cfg.worktree.trust_repository);
         assert_eq!(cfg.worktree.branch, "{key}");
+        assert_eq!(cfg.worktree.prefer, crate::checkout::Backend::Jj);
+        assert_eq!(cfg.worktree.jj.name, "{key}");
         assert!(cfg.worktree.focus);
         // `submit` ships commented out, so the worktree inherits [delegate].submit.
         assert_eq!(cfg.worktree.submit, None);
@@ -349,6 +389,10 @@ placement = "tab"
         let wt = &cfg.worktree;
         assert_eq!(wt.repo, "");
         assert!(wt.repos.is_empty());
+        assert_eq!(wt.prefer, crate::checkout::Backend::Jj);
+        assert_eq!(wt.jj.name, "{key}");
+        assert!(wt.jj.base.is_empty());
+        assert!(wt.jj.path.is_empty());
         assert_eq!(wt.branch, "{key}");
         assert_eq!(wt.label, "{key}");
         assert_eq!(wt.base, "");
@@ -376,6 +420,10 @@ placement = "tab"
         assert_eq!(wt.label, "{key}");
         assert_eq!(wt.base, "");
         assert_eq!(wt.path, "");
+        assert_eq!(wt.prefer, crate::checkout::Backend::Jj);
+        assert_eq!(wt.jj.name, "{key}");
+        assert!(wt.jj.base.is_empty());
+        assert!(wt.jj.path.is_empty());
         assert_eq!(cfg.delegate.placement, "tab");
         assert_eq!(wt.submit, None);
     }
@@ -405,5 +453,56 @@ submit = false
         let cfg: Config = toml::from_str(&raw).unwrap();
         assert_eq!(cfg.delegate.placement, "tab");
         assert_eq!(cfg.worktree.branch, "{key}");
+    }
+    #[test]
+    fn backend_preference_accepts_only_lowercase_git_or_jj() {
+        for (value, expected) in [
+            ("git", crate::checkout::Backend::Git),
+            ("jj", crate::checkout::Backend::Jj),
+        ] {
+            let raw = format!("{MINIMAL}\n[worktree]\nprefer = \"{value}\"\n");
+            let cfg: Config = toml::from_str(&raw).unwrap();
+            assert_eq!(cfg.worktree.prefer, expected);
+        }
+        for value in ["Git", "Jj", "hg", ""] {
+            let raw = format!("{MINIMAL}\n[worktree]\nprefer = \"{value}\"\n");
+            assert!(toml::from_str::<Config>(&raw).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn jj_templates_coexist_with_git_and_per_project_settings() {
+        let raw = format!(
+            "{MINIMAL}\n[worktree]\nprefer = \"git\"\nrepo = \"~/src/app\"\nbranch = \"git/{{key}}\"\nbase = \"main\"\npath = \"~/git/{{branch}}\"\nlabel = \"{{name}}\"\nfocus = false\ntrust_repository = true\nsubmit = false\n\n[worktree.repos]\nPROJ = \"~/src/project\"\n\n[worktree.jj]\nname = \"jj-{{key}}\"\nbase = \"trunk()\"\npath = \"~/jj/{{name}}\"\n"
+        );
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        let wt = &cfg.worktree;
+        assert_eq!(wt.prefer, crate::checkout::Backend::Git);
+        assert_eq!(wt.repo, "~/src/app");
+        assert_eq!(
+            wt.repos.get("PROJ").map(String::as_str),
+            Some("~/src/project")
+        );
+        assert_eq!(wt.branch, "git/{key}");
+        assert_eq!(wt.base, "main");
+        assert_eq!(wt.path, "~/git/{branch}");
+        assert_eq!(wt.jj.name, "jj-{key}");
+        assert_eq!(wt.jj.base, "trunk()");
+        assert_eq!(wt.jj.path, "~/jj/{name}");
+        assert_eq!(wt.label, "{name}");
+        assert!(!wt.focus);
+        assert!(wt.trust_repository);
+        assert_eq!(wt.submit, Some(false));
+    }
+
+    #[test]
+    fn partial_jj_table_retains_its_independent_defaults() {
+        let raw = format!("{MINIMAL}\n[worktree.jj]\nbase = \"main@origin\"\n");
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(cfg.worktree.jj.name, "{key}");
+        assert_eq!(cfg.worktree.jj.base, "main@origin");
+        assert_eq!(cfg.worktree.jj.path, "");
+        assert_eq!(cfg.worktree.branch, "{key}");
+        assert_eq!(cfg.worktree.prefer, crate::checkout::Backend::Jj);
     }
 }

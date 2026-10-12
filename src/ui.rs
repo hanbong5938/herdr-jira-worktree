@@ -1,5 +1,6 @@
 //! Rendering. One draw function per view; popup pickers render on top of the
 //! issue list.
+use crate::checkout::Backend;
 
 use crate::app::{is_epic, App, View};
 use crate::jira::Comment;
@@ -42,6 +43,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::WorktreeRepoInput => draw_worktree_repo_input(f, app),
         View::WorktreeListPicker => draw_worktree_list_picker(f, app),
         View::WorktreeNameInput => draw_worktree_name_input(f, app),
+        View::WorktreeExistingPathInput => draw_worktree_existing_path_input(f, app),
+        View::WorktreeRecoveryConfirm => draw_worktree_recovery_confirm(f, app),
         View::WorktreeAgentPicker => draw_worktree_agent_picker(f, app),
         View::HandoffConfirm => draw_handoff_confirm(f, app),
         View::SearchInput => draw_search(f, app),
@@ -611,6 +614,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    if app.view == View::WorktreeRecoveryConfirm {
+        f.render_widget(
+            Paragraph::new(fit_hints(
+                "I approve after manual inspection  ·  j/k or PgUp/PgDn review  ·  Esc cancel",
+                area.width as usize,
+            ))
+            .style(Style::new().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
     // A toast overrides the hint line for a few seconds.
     if let Some((msg, is_error, at)) = &app.toast {
         if at.elapsed().as_secs() < 5 {
@@ -628,14 +642,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         View::SearchInput => "Enter search  ·  Esc cancel",
         View::JqlInput => "Enter run JQL  ·  Ctrl-U clear  ·  Esc cancel",
         View::NewAgentCwdInput => "Enter start  ·  Ctrl-U clear  ·  Esc back",
-        View::WorktreeRepoInput | View::WorktreeNameInput => {
+        View::WorktreeRepoInput | View::WorktreeNameInput | View::WorktreeExistingPathInput => {
             "Enter next  ·  Ctrl-U clear  ·  Esc back"
         }
         View::AgentPicker => {
             "1-9 pick  ·  n new agent  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
         View::WorktreeProjectPicker => {
-            "1-9 pick  ·  j/k move  ·  Enter worktrees  ·  / type path  ·  Esc cancel"
+            "1-9 pick  ·  j/k move  ·  Enter checkouts  ·  / type path  ·  Esc cancel"
         }
         View::WorktreeListPicker => {
             "1-9 pick  ·  j/k move  ·  Enter new / reopen  ·  Esc back"
@@ -998,16 +1012,59 @@ fn picker_header(f: &mut Frame, inner: Rect, text: &str) -> Rect {
 fn draw_worktree_project_picker(f: &mut Frame, app: &App) {
     let title = format!("worktree for {} — project", worktree_issue_key(app));
     let projects = &app.wt_projects;
-    let h = projects.len() as u16 + 4;
-    let inner = popup(f, &title, 75, h);
+    let diagnostics = app.wt_project_error.is_some() || !app.wt_project_warnings.is_empty();
+    let diagnostic_height = if diagnostics { 6 } else { 0 };
+    let h = (projects.len() as u16).saturating_add(4 + diagnostic_height);
+    let inner = popup(f, &title, 85, h);
     let header = if app.wt_projects_loading {
-        "listing herdr projects…"
+        "listing herdr projects…".to_string()
+    } else if app.wt_project_error.is_some() {
+        "project discovery failed — inspect error below or type a repo path".to_string()
+    } else if projects.is_empty() && diagnostics {
+        "no available projects — inspect discovery errors or type a repo path".to_string()
     } else if projects.is_empty() {
-        "no git projects open in herdr — type a repo path"
+        "no Git or jj projects open in herdr — type a repo path".to_string()
+    } else if !app.wt_project_warnings.is_empty() {
+        format!(
+            "herdr projects · {} unavailable candidate(s) below · PgUp/PgDn diagnostics",
+            app.wt_project_warnings.len()
+        )
     } else {
-        "herdr projects (source checkouts) · ★ current workspace"
+        "herdr projects (source checkouts) · ★ current workspace".to_string()
     };
-    let list = picker_header(f, inner, header);
+    let [heading, diagnostics_area, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(diagnostic_height),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    f.render_widget(
+        Paragraph::new(header).style(Style::new().fg(if diagnostics {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        })),
+        heading,
+    );
+    if diagnostics {
+        let lines: Vec<Line> = app
+            .wt_project_error
+            .iter()
+            .chain(app.wt_project_warnings.iter())
+            .map(|warning| Line::styled(warning.clone(), Style::new().fg(Color::Yellow)))
+            .collect();
+        render_scrolled(
+            f,
+            lines,
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" discovery diagnostics "),
+            diagnostics_area,
+            app.wt_project_warning_scroll,
+            &app.wt_project_warning_scroll_max,
+            true,
+        );
+    }
     let name_w = projects
         .iter()
         .map(|p| p.name.chars().count())
@@ -1029,11 +1086,15 @@ fn draw_worktree_project_picker(f: &mut Frame, app: &App) {
                     Style::new().fg(ACCENT).bold(),
                 ),
                 Span::raw(short_path(&p.root)),
+                Span::styled(
+                    format!("  [{}]", p.backend.label()),
+                    Style::new().fg(Color::DarkGray),
+                ),
             ];
             if p.open_worktrees > 0 {
                 let s = if p.open_worktrees == 1 { "" } else { "s" };
                 spans.push(Span::styled(
-                    format!("  ({} open worktree{s})", p.open_worktrees),
+                    format!("  ({} open checkout{s})", p.open_worktrees),
                     Style::new().fg(Color::DarkGray),
                 ));
             }
@@ -1070,32 +1131,52 @@ fn draw_worktree_list_picker(f: &mut Frame, app: &App) {
         app.wt_repo_name
     );
     let worktrees = &app.wt_worktrees;
-    let h = worktrees.len() as u16 + 4;
-    let inner = popup(f, &title, 75, h);
+    let h = worktrees.len() as u16 + 5;
+    let inner = popup(f, &title, 85, h);
     let header = if app.wt_worktrees_loading {
-        format!("listing worktrees of {}…", short_path(&app.wt_repo))
-    } else {
         format!(
-            "create a worktree or reopen one of {}",
+            "resolving backend and listing checkouts of {}…",
             short_path(&app.wt_repo)
         )
+    } else if app.wt_validating_path {
+        "validating native identity and recovery receipt off-thread… Esc cancels".to_string()
+    } else if let Some(error) = &app.wt_error {
+        format!("repository unavailable: {error} (Esc to choose another)")
+    } else if let Some(repo) = &app.wt_repository {
+        format!("{} · {}", repo.backend.label(), short_path(&repo.root))
+    } else {
+        "repository not resolved".to_string()
     };
     let list = picker_header(f, inner, &header);
-    let default = if app.wt_default_branch.is_empty() {
+    let default = if app.wt_default_name.is_empty() {
         String::new()
     } else {
-        format!(" ({})", app.wt_default_branch)
+        format!(" ({})", app.wt_default_name)
+    };
+    let enabled =
+        !app.wt_worktrees_loading && app.wt_repository.is_some() && app.wt_error.is_none();
+    let noun = match app.wt_repository.as_ref().map(|r| r.backend) {
+        Some(Backend::Git) => "worktree",
+        Some(Backend::Jj) => "jj workspace",
+        None => "checkout",
     };
     let mut items = vec![ListItem::new(Line::from(vec![
         num_span(0),
         Span::styled(
-            format!("+ new worktree{default}"),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            format!(
+                "+ new {noun}{default}{}",
+                if enabled { "" } else { " (unavailable)" }
+            ),
+            Style::new().fg(if enabled {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
         ),
     ]))];
-    let branch_w = worktrees
+    let name_w = worktrees
         .iter()
-        .map(|w| w.branch.chars().count())
+        .map(|w| w.name.chars().count())
         .max()
         .unwrap_or(0)
         .min(32);
@@ -1103,12 +1184,17 @@ fn draw_worktree_list_picker(f: &mut Frame, app: &App) {
         let mut spans = vec![
             num_span(i + 1),
             Span::styled(
-                format!("{:<branch_w$}  ", truncate_label(&w.branch, branch_w)),
+                format!("{:<name_w$}  ", truncate_label(&w.name, name_w)),
                 Style::new().fg(ACCENT).bold(),
             ),
-            Span::raw(short_path(&w.path)),
+            Span::raw(
+                w.path
+                    .as_deref()
+                    .map(short_path)
+                    .unwrap_or_else(|| "path unknown — Enter to locate".to_string()),
+            ),
         ];
-        if w.is_main {
+        if w.is_source {
             spans.push(Span::styled("  (source)", Style::new().fg(Color::DarkGray)));
         }
         if w.open {
@@ -1135,47 +1221,142 @@ fn draw_worktree_name_input(f: &mut Frame, app: &App) {
     );
 }
 
+fn draw_worktree_existing_path_input(f: &mut Frame, app: &App) {
+    let name = app
+        .wt_selected
+        .as_ref()
+        .map_or("", |entry| entry.name.as_str());
+    let title = format!("locate existing jj workspace {name} (must match native identity)");
+    let inner = popup(f, &title, 85, 4);
+    let [status, input] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    f.render_widget(
+        Paragraph::new(if app.wt_validating_path {
+            "validating repository and workspace identity…"
+        } else {
+            "Enter the checkout path; Esc returns to the same workspace"
+        }),
+        status,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(app.wt_existing_path_input.clone()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ])),
+        input,
+    );
+}
+
+fn draw_worktree_recovery_confirm(f: &mut Frame, app: &App) {
+    let Some(warning) = app.wt_recovery_warning.as_ref() else {
+        return;
+    };
+    let Some(path) = app
+        .wt_selected
+        .as_ref()
+        .and_then(|entry| entry.path.as_ref())
+    else {
+        return;
+    };
+    let title = format!(
+        "manual recovery · {} · {}",
+        worktree_issue_key(app),
+        app.wt_name
+    );
+    let inner = popup(f, &title, 90, f.area().height.saturating_sub(2).min(22));
+    let [heading, details] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    f.render_widget(
+        Paragraph::new("UNRESOLVED native creation · Enter does NOT approve · inspect first, then press capital I")
+            .style(Style::new().fg(Color::Yellow).bold()),
+        heading,
+    );
+    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+    let mut lines = vec![
+        Line::styled("Pending/Failed receipt — native files may be partial. Do not delete, reset, or add again.", Style::new().fg(Color::Yellow).bold()),
+        Line::default(),
+    ];
+    lines.extend(warning.lines().map(|line| Line::from(line.to_owned())));
+    lines.extend([
+        Line::default(),
+        Line::from(format!("Actual checkout path: {path}")),
+        Line::from(format!("Inspect native workspaces: jj --ignore-working-copy -R {quoted} workspace list")),
+        Line::from(format!("Inspect native checkout: jj --ignore-working-copy -R {quoted} status")),
+        Line::from("Inspect the path, working-copy identity, files and ~/.herdr/jj-workspaces receipt before approving."),
+        Line::from("I opens this Existing checkout only for this request; it does not mark the receipt Ready."),
+    ]);
+    render_scrolled(
+        f,
+        lines,
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" manual inspection ")
+            .border_style(Style::new().fg(Color::Yellow)),
+        details,
+        app.wt_recovery_scroll,
+        &app.wt_recovery_scroll_max,
+        true,
+    );
+}
+
 fn draw_worktree_agent_picker(f: &mut Frame, app: &App) {
     let title = format!("worktree for {} — start an agent?", worktree_issue_key(app));
     let agents = &app.cfg.delegate.agents;
-    let h = (agents.len() as u16 + 6).max(6);
+    let h = (agents.len() as u16 + 6 + u16::from(app.wt_recovery_warning.is_some())).max(6);
     let inner = popup(f, &title, 85, h);
-    let [summary, list] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(inner);
-    let base = if app.wt_existing {
+    let [summary, list] = Layout::vertical([
+        Constraint::Length(3 + u16::from(app.wt_recovery_warning.is_some())),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    let backend = app.wt_repository.as_ref().map(|r| r.backend);
+    let base = if app.wt_selected.is_some() {
         "existing checkout (unchanged)".to_string()
+    } else if backend == Some(Backend::Jj) {
+        let configured = app.cfg.worktree.jj.base.trim();
+        if configured.is_empty() {
+            "source @ parent(s) (native jj default)".to_string()
+        } else {
+            configured.to_string()
+        }
     } else if !app.cfg.worktree.base.trim().is_empty() {
-        app.cfg.worktree.base.clone()
-    } else if let Some(source) = app.wt_worktrees.iter().find(|w| w.is_main) {
-        format!("HEAD of source branch {}", source.branch)
+        app.cfg.worktree.base.trim().to_string()
+    } else if let Some(source) = app.wt_worktrees.iter().find(|w| w.is_source) {
+        format!("HEAD of source branch {}", source.name)
     } else {
         "HEAD of source checkout".to_string()
     };
+    let backend_label = backend.map_or("checkout", Backend::label);
+    let name_label = if app.wt_selected.is_some() {
+        "existing checkout"
+    } else if backend == Some(Backend::Git) {
+        "new branch"
+    } else {
+        "new jj workspace"
+    };
+    let mut summary_lines = vec![
+        Line::from(format!(
+            "repo: {} ({}) · {backend_label}",
+            app.wt_repo_name,
+            short_path(&app.wt_repo)
+        )),
+        Line::from(format!("{name_label}: {}", app.wt_name)),
+        Line::from(format!("base: {base}")),
+    ];
+    if app.wt_recovery_warning.is_some() {
+        summary_lines.push(Line::styled(
+            "manual inspection approved for this Existing request only",
+            Style::new().fg(Color::Yellow).bold(),
+        ));
+    }
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "repo: {} ({})",
-                app.wt_repo_name,
-                short_path(&app.wt_repo)
-            )),
-            Line::from(format!(
-                "{}: {}",
-                if app.wt_existing {
-                    "existing checkout"
-                } else {
-                    "new branch"
-                },
-                app.wt_branch
-            )),
-            Line::from(format!("base: {base}")),
-        ])
-        .style(Style::new().fg(Color::Yellow)),
+        Paragraph::new(summary_lines).style(Style::new().fg(Color::Yellow)),
         summary,
     );
     let mut items = vec![ListItem::new(Line::from(vec![
         num_span(0),
         Span::styled(
-            "no agent — just open the worktree",
+            "no agent — just open the checkout",
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
     ]))];
@@ -1302,7 +1483,7 @@ fn draw_help(f: &mut Frame, detail: bool) {
             ("r", "refresh this issue and its comments"),
             ("s", "change issue status"),
             ("d", "delegate issue to an agent"),
-            ("w", "git worktree: project → new/existing worktree → agent"),
+            ("w", "Git worktree / jj workspace → existing or new → agent"),
             ("o", "open issue in browser"),
             ("z", "zoom pane (fullscreen toggle)"),
             ("?", "this help"),
@@ -1320,7 +1501,7 @@ fn draw_help(f: &mut Frame, detail: bool) {
             ("s", "change issue status"),
             ("d", "delegate issue to an agent"),
             ("n", "in delegate picker: start a new agent"),
-            ("w", "git worktree: project → new/existing worktree → agent"),
+            ("w", "Git worktree / jj workspace → existing or new → agent"),
             ("o", "open issue in browser"),
             ("z", "zoom pane (fullscreen toggle)"),
             ("r", "refresh current query (filter / search / JQL)"),
@@ -1392,7 +1573,7 @@ mod footer_tests {
 #[cfg(test)]
 mod scroll_tests {
     use crate::app::{App, PromptPreview, View};
-    use crate::herdr::RepoWorktree;
+    use crate::checkout::{Backend, Entry, Repository};
     use crate::jira::{Comment, Issue};
     use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::backend::TestBackend;
@@ -1500,35 +1681,45 @@ mod scroll_tests {
     }
 
     #[test]
-    fn worktree_agent_choice_shows_real_source_and_configured_base() {
+    fn checkout_picker_shows_backend_and_native_base_without_modifying_existing() {
         let mut app = detail_app();
         app.view = View::WorktreeAgentPicker;
         app.wt_repo = "/tmp/repos/component".into();
         app.wt_repo_name = "component".into();
-        app.wt_branch = "ABC-1-fix".into();
-        app.wt_worktrees = vec![RepoWorktree {
-            branch: "develop".into(),
-            path: app.wt_repo.clone(),
+        app.wt_name = "ABC-1-fix".into();
+        app.wt_repository = Some(Repository {
+            backend: Backend::Git,
+            key: "git:/tmp/repos/component".into(),
+            root: app.wt_repo.clone(),
+            name: "component".into(),
+        });
+        app.wt_worktrees = vec![Entry {
+            name: "develop".into(),
+            path: Some(app.wt_repo.clone()),
             open: true,
-            is_main: true,
+            is_source: true,
         }];
         let mut term = Terminal::new(TestBackend::new(110, 25)).unwrap();
         let source = text(&render(&mut term, &app));
-        assert!(source.contains("repo: component"), "{source}");
+        assert!(source.contains("Git worktree"), "{source}");
         assert!(source.contains("new branch: ABC-1-fix"), "{source}");
         assert!(
             source.contains("base: HEAD of source branch develop"),
             "{source}"
         );
-        assert!(!source.contains("origin/main"), "{source}");
         app.cfg.worktree.base = "release/2026".into();
         let configured = text(&render(&mut term, &app));
         assert!(configured.contains("base: release/2026"), "{configured}");
-        assert!(
-            !configured.contains("source branch develop"),
-            "{configured}"
-        );
-        app.wt_existing = true;
+        app.wt_repository.as_mut().unwrap().backend = Backend::Jj;
+        let native = text(&render(&mut term, &app));
+        assert!(native.contains("jj workspace"), "{native}");
+        assert!(native.contains("source @ parent(s)"), "{native}");
+        app.wt_selected = Some(Entry {
+            name: app.wt_name.clone(),
+            path: Some("/x/actual".into()),
+            open: false,
+            is_source: false,
+        });
         let existing = text(&render(&mut term, &app));
         assert!(
             existing.contains("existing checkout: ABC-1-fix"),
@@ -1538,6 +1729,38 @@ mod scroll_tests {
             existing.contains("base: existing checkout (unchanged)"),
             "{existing}"
         );
+    }
+
+    #[test]
+    fn unknown_path_and_backend_failure_are_visible_in_picker() {
+        let mut app = detail_app();
+        app.view = View::WorktreeListPicker;
+        app.wt_repo = "/tmp/repos/component".into();
+        app.wt_worktrees_loading = true;
+        let mut term = Terminal::new(TestBackend::new(110, 25)).unwrap();
+        let loading = text(&render(&mut term, &app));
+        assert!(loading.contains("resolving backend"), "{loading}");
+        assert!(loading.contains("(unavailable)"), "{loading}");
+        app.wt_worktrees_loading = false;
+        app.wt_error = Some("invalid .jj repo pointer".into());
+        let failed = text(&render(&mut term, &app));
+        assert!(failed.contains("repository unavailable"), "{failed}");
+        assert!(!failed.contains("Git worktree"), "{failed}");
+        app.wt_error = None;
+        app.wt_repository = Some(Repository {
+            backend: Backend::Jj,
+            key: "jj:store".into(),
+            root: app.wt_repo.clone(),
+            name: "component".into(),
+        });
+        app.wt_worktrees = vec![Entry {
+            name: "unknown".into(),
+            path: None,
+            open: false,
+            is_source: false,
+        }];
+        let unknown = text(&render(&mut term, &app));
+        assert!(unknown.contains("path unknown"), "{unknown}");
     }
 
     #[test]

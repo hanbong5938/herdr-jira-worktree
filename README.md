@@ -3,11 +3,11 @@
 **English** | [한국어](README.ko.md)
 
 Fork of [a2u/herdr-jira](https://github.com/a2u/herdr-jira) by Vitalii Rudnykh,
-adding a `w` key that checks out a Jira issue into a new or existing git
-worktree per herdr project, and issue comments in the details view. Versioned
+adding a `w` key that opens a Jira issue in a Git worktree or native jj
+workspace, and issue comments in the details view. Versioned
 independently of upstream (this fork starts at 0.1.0).
 
-A focused Jira issue → git worktree launcher in a [herdr](https://herdr.dev)
+A focused Jira issue → Git worktree / jj workspace launcher in a [herdr](https://herdr.dev)
 pane, not a replacement for Jira. Browse JQL filters, search, read issue details
 and comments, then optionally open a worktree or start an agent. Status
 transitions and agent delegation are explicit actions.
@@ -55,13 +55,13 @@ back to the list.
 j/k scroll  ·  Tab comments  ·  w worktree  ·  d delegate  ·  Esc back
 ```
 
-### Issue → git worktree (`w`)
+### Issue → Git worktree or jj workspace (`w`)
 
 Press `w` on an issue (in the list or the details view) to work on it in its
-own git worktree, opened as a herdr workspace. Three quick picks; `Esc` goes
+own Git worktree or jj workspace, opened as a herdr UI workspace. Three quick picks; `Esc` goes
 back one step, `1`–`9` picks a row directly.
 
-**1. Project** — the git projects open in herdr, the current one first (★).
+**1. Project** — the Git and jj projects open in herdr, the current one first (★).
 `type path…` takes any other repo.
 
 ```
@@ -73,8 +73,8 @@ back one step, `1`–`9` picks a row directly.
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-**2. Worktree** — `+ new worktree` creates a branch named after the issue (you
-can edit the name before `Enter`), or pick an existing worktree to reopen it.
+**2. Checkout** — `+ new` creates a Git branch/worktree or a named jj
+workspace (you can edit the name before `Enter`), or reopens an existing checkout.
 
 ```
 ╭ worktree for PROJ-142 — mobile-app ──────────────────────────────────╮
@@ -85,11 +85,12 @@ can edit the name before `Enter`), or pick an existing worktree to reopen it.
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-**3. Agent** — just open the worktree without fetching a handoff snapshot, or
-pick an agent from `[[delegate.agents]]`. A complete snapshot dispatches per
-the submit setting; only warnings require reviewing the bounded Jira context
-before proceeding. The final picker shows repo, branch, existing checkout vs
-new checkout, and the configured base or selected source branch `HEAD`.
+**3. Agent** — just open the checkout without fetching a handoff snapshot, or
+pick an agent from `[[delegate.agents]]`. Complete snapshots dispatch according
+to the submit setting; only incomplete snapshots require reviewing the bounded
+Jira context and confirming before checkout creation. The final picker shows
+repo, checkout name, existing checkout vs new checkout, and the configured
+base or selected source branch `HEAD`.
 
 ```
 ╭ worktree PROJ-142 — start an agent? ──────╮
@@ -99,9 +100,10 @@ new checkout, and the configured base or selected source branch `HEAD`.
 ╰───────────────────────────────────────────╯
 ```
 
-herdr opens the worktree as a new workspace grouped with the project. To skip
+herdr opens the checkout in a UI workspace; Git worktrees are grouped with
+the project, while native jj workspaces use generic herdr UI workspaces. To skip
 step 1, map Jira projects to repos in `[worktree.repos]`; see
-[Worktrees (`w`)](#worktrees-w) for all options.
+[Worktrees and jj workspaces (`w`)](#worktrees-and-jj-workspaces-w) for all options.
 
 ## Features
 
@@ -127,10 +129,9 @@ step 1, map Jira projects to repos in `[worktree.repos]`; see
   authenticated Jira snapshot and review its prompt before delivery. Or choose
   **+ start new agent…** (`n`) to pick an agent type and working directory;
   herdr runs it via `pane run` and sends the reviewed prompt once ready.
-- **Worktree** — `w` creates or reopens a git worktree for the selected issue,
-  per project like herdr's own worktree creation: pick one of herdr's projects
-  (current first), then **+ new worktree** (name prefilled with the issue key)
-  or one of its existing worktrees, then optionally start an agent in it that
+- **Checkout** — `w` creates or reopens a Git worktree or native jj workspace for
+  the selected issue: pick a project (current first), then **+ new** (name
+  prefilled with the issue key) or an existing checkout, then optionally start an agent in it that
   receives the Jira prompt.
 
 Works with Jira Cloud (email + API token) and Jira Server / Data Center
@@ -157,12 +158,18 @@ Handoff change note: after bounded read/recovery behavior, delegation now
 prepares a reviewed, bounded issue snapshot instead of a link-only default.
 Follow-up reliability fixes pin wizard identity, isolate status writes, and
 preserve known-not-sent recovery across config reload.
+
+Checkout repair change note: colocated roots prefer native jj by default (Git
+priority is configurable); unrelated discovery failures remain visible without
+hiding healthy projects. Durable native jj receipts distinguish a safe reopen
+from an unresolved creation, which requires manual inspection and explicit
+Existing approval rather than an automatic retry.
 Neither handoff nor an agent response changes Jira status automatically;
 use `s` to make that decision yourself.
 
 ## Install
 
-Requires herdr **0.8.0+** and a Rust toolchain (https://rustup.rs) at install time.
+Requires herdr **0.8.0+** and a Rust **1.89+** toolchain (https://rustup.rs) at install time.
 
 This fork (plugin id `han.jira-worktree`, with the `w` worktree key) installs with:
 
@@ -235,9 +242,9 @@ can also set `[jira].default_project = "PROJ"` and use the project filter, or
 define your own `[[filters]]` in config. Press `R` in the pane after edits.
 Select an issue with `Enter` to read it; `w` can open a worktree with **no
 agent**, and neither a repository mapping nor an AI agent is needed to browse.
-For `w`, choose an open herdr git project or type a repo path; optional
-`[worktree.repos]` mappings only skip that choice. New branches start from the
-selected repo's `HEAD` by default, **not** implicitly `origin/main`.
+For `w`, choose an open Git or jj project or type a repo path; optional
+`[worktree.repos]` mappings only skip that choice. New Git branches start from the selected repo's `HEAD` by default, **not**
+implicitly `origin/main`; jj defaults to the source `@` commit's parent(s).
 
 ## Open the pane
 
@@ -274,7 +281,7 @@ command = "han.jira-worktree.open-jira-tab"
 | `s` | change issue status |
 | `d` | delegate issue to a running agent, or start a new one |
 | `D` | after a known-not-sent readiness failure: recheck and send to the retained same agent pane only (never retry an uncertain send failure) |
-| `w` | git worktree for the issue (project → new/existing worktree → optional agent) |
+| `w` | Git worktree or jj workspace (project → new/existing checkout → optional agent) |
 | `n` | in the delegate picker: start a new agent |
 | `1`–`9` | quick pick inside any popup (agents, transitions, filters) |
 | `o` | open issue in the browser |
@@ -365,82 +372,147 @@ is **not sent**; `D` rechecks the retained pane without starting another agent.
 `wait_ready_ms = 0` explicitly disables the check and is not recommended for
 cold agent starts.
 
-## Worktrees (`w`)
+## Worktrees and jj workspaces (`w`)
 
-`w` (from the issue list or the issue details) creates — or reopens — a git
-worktree for the issue, per project like herdr's own worktree creation; `Esc`
-goes back one step:
+`w` (issue list or details) creates or reopens a Git worktree or a native jj
+workspace. At a colocated root it prefers jj by default;
+`[worktree].prefer = "git"` reverses priority, not the supported backends.
+An available Git checkout at that same root can be selected when the jj
+executable is missing. A Git-only repo works without jj installed.
+Errors stay with that backend rather than silently switching; an explicitly
+selected bad repo reports its error. jj requires version 0.38 or newer with
+workspace-listing and JSON-escaping template capabilities. A jj repository
+backed by Git does not by itself make a usable Git checkout.
+`Esc` returns to the previous step:
 
-1. **Project** — `[worktree.repos]` by project key (`PROJ` for `PROJ-1666`),
-   else `[worktree].repo`, else you pick one of the git projects herdr has open
-   (`herdr workspace list`): one row per source repository, the current
-   workspace's project first (★, also when this pane runs in one of its linked
-   worktrees), then the rest in workspace order, each with its source checkout
-   path and number of open worktree workspaces. The last row, **type path…**
-   (`/`), takes any repo directory.
-2. **Worktree** — the project's checkouts (`herdr worktree list`), `[open]` when
-   a herdr workspace already shows them. **+ new worktree** asks for the name,
-   prefilled from the `branch` template (default `{key}`); edit it freely
-   (`Ctrl-U` clears) — on `Enter` it is sanitized into a valid git branch name.
-   Picking an existing worktree reopens it; the issue's worktree is
-   preselected when it already exists.
-3. **Agent** — **no agent** just opens the worktree without reading a Jira
-   snapshot; or pick an agent from `[[delegate.agents]]` and review the same
-   bounded context as `d` before opening the worktree/starting the agent.
-   The picker displays the selected repo and branch, whether checkout exists
-   or will be created, and the configured base ref or source branch `HEAD`
-   (not an assumed `origin/main`). `submit` follows `[delegate].submit` unless
-   `[worktree].submit` is set. With `[worktree] submit = false`, the prompt
-   is pasted only; edit/review and press Enter in the agent yourself.
+1. **Project** — `[worktree.repos]` by Jira project key, otherwise
+   `[worktree].repo`, otherwise choose an open Git/jj project (current first)
+   or **type path…** (`/`) for any repository directory. Paths inside a
+   checkout resolve to its nearest checkout root; nested repositories and
+   sibling checkouts remain distinct. Projects sharing a repository store are
+   deduplicated. Unrelated unreadable or malformed workspace candidates appear
+   as scrollable path-specific warnings without hiding healthy Git projects;
+   a failed explicit selection still errors. Paths and checkout counts refer
+   to herdr UI workspaces; a jj workspace is a native jj checkout, not the same
+   thing as a herdr UI workspace.
+2. **Checkout** — pick an existing Git worktree (named by branch) or jj
+   workspace (named by workspace), or **+ new** with an editable issue-key name
+   (`Ctrl-U` clears). An existing matching checkout is preselected; `[open]`
+   indicates that its path is already open in herdr. Older jj workspace
+   metadata can lack a recorded path even when using a modern jj executable.
+   Enter the path when prompted; the plugin verifies repository and workspace
+   name before opening it. Ambiguous matches (including native workspaces
+   sharing `@`) fail safely: it never guesses a path or creates a replacement.
+   An unresolved native creation requires inspecting its reported path and
+   selecting **Existing**; only capital `I` acknowledges that inspection for
+   this request. `Enter`, `1`, and lowercase `i` do not approve it. `Esc` cancels.
+3. **Agent** — **no agent** opens without a Jira snapshot; selecting an agent
+   prepares bounded context before checkout creation. Complete snapshots
+   dispatch according to the configured submit setting; incomplete snapshots
+   require preview confirmation before native mutation, and `Esc` cancels
+   without creating a checkout. The picker displays backend, name, existing/new
+   state, and base. Git's default new branch starts from the selected repo's
+   `HEAD`, not assumed `origin/main`; an unset jj base starts from the source
+   `@` commit's parent(s), **not `@`**.
+   `[worktree].submit` overrides `[delegate].submit`; `false` pastes for manual
+   review/Enter instead of submitting.
 
-Add a `[worktree]` table at the end of `config.toml` (after `[[delegate.agents]]`):
+Add these tables after any `[[delegate.agents]]` entries in `config.toml`:
 
 ```toml
 [worktree]
-# repo = "~/workspace/platform"        # optional; unset = pick a herdr project
-branch = "{key}"                       # name prefill, e.g. "{type}/{key}-{slug}"
-# base = "origin/main"                 # optional override; default: selected repo's HEAD
-focus = true                           # focus the worktree workspace
-# path = "~/worktrees/{branch}"        # checkout path (default: herdr's worktrees dir)
-# label = "{key}"                      # workspace label
-# trust_repository = false             # passes --trust-repository; verified repos only
-# submit = false                       # unset = [delegate].submit; false = paste only, you press Enter
+# repo = "~/workspace/platform"      # unset = choose a herdr project
+prefer = "jj"                         # default; "git" gives Git priority
+branch = "{key}"                      # Git branch input, e.g. "{type}/{key}-{slug}"
+# base = "origin/main"               # Git only; literal ref, default: selected repo HEAD
+# path = "~/worktrees/{branch}"      # Git only; default: herdr worktrees dir
+focus = true
+# label = "{key}"                    # herdr UI workspace label
+# trust_repository = false           # Git only; verified repos only
+# submit = false                     # unset = [delegate].submit
 
-[worktree.repos]                       # per Jira project key
+[worktree.jj]
+name = "{key}"                        # native jj workspace name input
+# base = "main@origin"               # unset = source @ parent(s)
+# path = "~/jj/{name}"               # unset = ~/.herdr/jj-workspaces/<repo-name>-<stable repo-key digest>/<name-slug>
+
+[worktree.repos]
 PROJ = "~/workspace/project"
 ```
 
-### Worktree checkout
+### Git checkout
 
-The repo directory must be inside a git repo. The plugin first tries to open an
-existing worktree for the branch, and only creates one if herdr reports
-`worktree_not_found`:
+For a **new Git name**, the plugin opens the named branch's worktree first and
+creates it **only** on herdr's structured `worktree_not_found` response:
 
 ```sh
 herdr worktree open --cwd <repo> --branch <branch> [--label <label>] --focus|--no-focus
 herdr worktree create --cwd <repo> --branch <branch> [--base <ref>] [--path <path>] [--label <label>] --focus|--no-focus
 ```
 
-herdr opens the checkout as a new workspace grouped with the repo's workspace,
-and an agent runs in its root pane. If that worktree's workspace is already
-open, the agent gets a new tab labelled with the issue key there instead — the
-plugin never types into a pane that may already be running an agent.
-`focus` picks `--focus`/`--no-focus`. `trust_repository = true` adds
-`--trust-repository` to both commands — only enable it for repositories you
-have verified.
+Git `base` is a literal ref, not a template: `base = "base/{key}"` uses the
+actual ref named `base/{key}`, not an issue-key-expanded ref.
 
-To clean up a worktree and its workspace:
+Selecting an existing Git worktree instead validates its exact path and opens
+or reuses its herdr UI workspace; it never recreates a missing checkout.
+
+Git worktrees open in herdr UI workspaces grouped with the repository's
+workspace. `trust_repository = true` adds `--trust-repository` to these Git
+commands; enable it only for repositories you have verified. Git cleanup:
 
 ```sh
 herdr worktree remove --workspace <id>   # add --force for uncommitted changes
 ```
 
-### Worktree placeholders
+### Native jj checkout
 
-`branch`: `{key}` `{slug}` `{type}`. `path` and `label` additionally accept
-`{branch}`. The name is sanitized into a valid git ref; a summary with no ASCII
-letters or digits yields an empty `{slug}`, so `{key}-{slug}` falls back to
-just the key.
+The plugin uses jj itself to create a new workspace, without creating a
+bookmark or moving the source checkout:
+
+```sh
+jj -R <source> workspace add --name <name> [-r <base>] <destination>
+```
+
+jj's native colocation behavior applies by default; jj may itself create an
+associated Git worktree. The plugin does **not** use `herdr worktree create`
+for jj. By default, destination is
+`~/.herdr/jj-workspaces/<repo-name>-<stable repo-key digest>/<name-slug>`,
+independent of herdr's Git worktrees directory. Native names and paths are
+verified after creation; conflicts never overwrite an existing checkout.
+Nonblocking leases on the name and destination prevent concurrent creation
+or UI attachment to the same checkout. Opening a jj checkout uses herdr's
+generic UI workspace creation, which does **not** imply the same built-in Git
+project grouping. Reopening an already-open UI workspace reuses it, putting
+an agent in a fresh tab instead of typing into an occupied pane. Generic
+workspace creation retains herdr's normal trust checks; `trust_repository`
+does not bypass them for jj.
+
+Native creation records a durable Pending receipt before `jj workspace add`
+under `~/.herdr/jj-workspaces/.native-receipts-v1`. A nonzero add always reports
+an error and retains native files, even if the checkout appears fully initialized.
+It records Failed if possible, otherwise leaves Pending. Ready requires a successful
+exit, fresh native identity validation, and a durable receipt commit. A crash
+or receipt failure before Ready leaves creation unresolved: do **not** delete,
+reset, or automatically retry it. Inspect the reported path and native jj
+workspace state first. For unresolved Pending/Failed entries, select
+**Existing** and press capital `I` at the manual-inspection prompt; this
+approves this request only and does not turn the receipt Ready. Ordinary
+healthy external Existing checkouts need no approval. Changed checkout
+identity, ambiguous names, or corrupt receipts fail closed.
+
+If creation reached Ready but herdr UI opening failed, the native workspace
+and files remain. Re-run `w` with the same **+ new** request to attach it,
+including after restarting the plugin; do not create a replacement. Clean up
+a jj checkout with jj's native workspace commands only after inspecting its
+state; do not use `herdr worktree remove` for jj.
+
+### Checkout placeholders
+
+Both names accept `{key}`, `{slug}`, `{type}`. Git `branch` is sanitized as a
+Git ref; jj `name` names a native workspace. `label`, Git `path`, and jj `path`
+accept neutral `{name}`; `{branch}` is Git-only (including Git labels/paths)
+and is rejected for jj labels. A summary without ASCII letters or digits
+produces an empty `{slug}`, so `{key}-{slug}` falls back to the key.
 
 ### Manual validation checklist
 
@@ -459,15 +531,16 @@ results. Record outcomes against **actual opportunities**, not total sessions:
   refers to the issue's actual context. Record grounded handoffs / actual
   handoff opportunities.
 - For paired work, try `w` with no agent, then an agent on a suitable repo;
-  verify the repo/branch/base or existing checkout displayed, compare
+  verify the repo/backend/name/base or existing checkout displayed, compare
   `submit = false` with `submit = true`, and observe focus override behavior.
   Record successful paired workflows / actual paired-work opportunities.
 - On a later relevant issue, observe whether someone chooses `d`/`w` without
   prompting; record unprompted reuses / actual later relevant opportunities.
   Do not count absent opportunities as failures or assert a success rate from
   this checklist. Status `s` is manual, not inferred from agent output;
-  remove unwanted worktrees explicitly with
-  `herdr worktree remove --workspace <id>` after reviewing uncommitted changes.
+  remove unwanted Git worktrees explicitly with
+  `herdr worktree remove --workspace <id>` after reviewing uncommitted changes;
+  use native jj workspace cleanup for jj.
 
 ## License
 
